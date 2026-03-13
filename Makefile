@@ -2,7 +2,7 @@
 # Supports PostgreSQL 14-17
 
 EXTENSION = pgedge_vectorizer
-EXTVERSION = 1.0-beta3
+EXTVERSION = 1.0
 
 # Extension module and data files
 MODULE_big = $(EXTENSION)
@@ -21,8 +21,10 @@ OBJS = src/pgedge_vectorizer.o \
 
 DATA = sql/$(EXTENSION)--$(EXTVERSION).sql \
        sql/$(EXTENSION)--1.0-beta2.sql \
+       sql/$(EXTENSION)--1.0-beta3.sql \
        sql/$(EXTENSION)--1.0-beta1--1.0-beta2.sql \
-       sql/$(EXTENSION)--1.0-beta2--1.0-beta3.sql
+       sql/$(EXTENSION)--1.0-beta2--1.0-beta3.sql \
+       sql/$(EXTENSION)--1.0-beta3--1.0.sql
 
 # Test configuration for pg_regress
 REGRESS = setup chunking hybrid_chunking queue vectorization multi_column maintenance edge_cases providers worker cleanup embedding pk_types stale_embeddings
