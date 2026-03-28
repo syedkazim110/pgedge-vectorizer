@@ -440,6 +440,11 @@ BEGIN
         WHERE q.chunk_table LIKE source_table::TEXT || '_%_chunks'
         AND q.status IN ('pending', 'processing');
 
+        -- Remove all vectorizer registry entries for this source table
+        EXECUTE
+            'DELETE FROM pgedge_vectorizer.vectorizers WHERE source_table = $1'
+        USING source_table::TEXT;
+
         -- Optionally drop all chunk tables
         IF drop_chunk_table THEN
             RAISE NOTICE 'Warning: Specify source_column to drop specific chunk table';
@@ -867,7 +872,7 @@ CREATE OR REPLACE FUNCTION pgedge_vectorizer.hybrid_search(
     p_rrf_k          INT     DEFAULT 60
 )
 RETURNS TABLE (
-    source_id   BIGINT,
+    source_id   TEXT,
     chunk       TEXT,
     dense_rank  INT,
     sparse_rank INT,
@@ -899,11 +904,15 @@ BEGIN
     v_query_sparse := pgedge_vectorizer.bm25_query_vector(
                           p_query, v_chunk_table);
 
-    -- Run both ranked lists and merge with Reciprocal Rank Fusion
+    -- Run both ranked lists and merge with Reciprocal Rank Fusion.
+    -- Join on chunk id (not source_id) to avoid mixing unrelated chunks
+    -- from the same document.  source_id is cast to TEXT to support
+    -- arbitrary PK types (BIGINT, UUID, VARCHAR, etc.).
     RETURN QUERY EXECUTE format($sql$
         WITH dense AS (
             SELECT
-                source_id,
+                id,
+                source_id::text AS source_id,
                 content AS chunk,
                 ROW_NUMBER() OVER (
                     ORDER BY embedding <=> %L::vector
@@ -914,7 +923,8 @@ BEGIN
         ),
         sparse AS (
             SELECT
-                source_id,
+                id,
+                source_id::text AS source_id,
                 content AS chunk,
                 ROW_NUMBER() OVER (
                     ORDER BY sparse_embedding <#> %L::sparsevec ASC
@@ -934,10 +944,10 @@ BEGIN
                     + (1.0 - %s::float8) / (%s + COALESCE(s.rnk, 9999))
                 )                                    AS rrf_score
             FROM dense d
-            FULL OUTER JOIN sparse s USING (source_id)
+            FULL OUTER JOIN sparse s USING (id)
         )
         SELECT
-            source_id::bigint,
+            source_id,
             chunk,
             dense_rank,
             sparse_rank,
@@ -971,7 +981,7 @@ CREATE OR REPLACE FUNCTION pgedge_vectorizer.hybrid_search_simple(
     p_limit        INT DEFAULT 10
 )
 RETURNS TABLE (
-    source_id  BIGINT,
+    source_id  TEXT,
     chunk      TEXT,
     rrf_score  FLOAT8
 )

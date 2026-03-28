@@ -384,6 +384,7 @@ process_queue_batch(int worker_id)
 		int64 *chunk_ids = palloc(n_items * sizeof(int64));
 		char **chunk_tables = palloc(n_items * sizeof(char *));
 		const char **contents = palloc(n_items * sizeof(char *));
+		int *content_lens = palloc(n_items * sizeof(int));
 		int *attempts = palloc(n_items * sizeof(int));
 		int *max_attempts = palloc(n_items * sizeof(int));
 		float **embeddings = NULL;
@@ -409,6 +410,7 @@ process_queue_batch(int worker_id)
 			chunk_tables[i] = TextDatumGetCString(val);
 
 			val = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 4, &isnull);
+			content_lens[i] = (int) VARSIZE_ANY_EXHDR(DatumGetTextPP(val));
 			contents[i] = TextDatumGetCString(val);
 
 			val = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 5, &isnull);
@@ -552,7 +554,7 @@ process_queue_batch(int worker_id)
 							char	   *sparse_str;
 							int			ret_bm25;
 
-							content_len = (int) strlen(contents[idx]);
+							content_len = content_lens[idx];
 							tokens = bm25_tokenize(contents[idx],
 												  &ntokens);
 							stats = bm25_load_idf_stats(
@@ -571,10 +573,10 @@ process_queue_batch(int worker_id)
 								psprintf(
 									"UPDATE %s SET "
 									"sparse_embedding = "
-									"'%s'::sparsevec "
+									"%s::sparsevec "
 									"WHERE id = %ld",
 									chunk_tables[idx],
-									sparse_str,
+									quote_literal_cstr(sparse_str),
 									chunk_ids[idx]),
 								false, 0);
 

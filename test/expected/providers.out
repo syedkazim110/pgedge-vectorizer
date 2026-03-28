@@ -4,7 +4,7 @@
 SHOW pgedge_vectorizer.provider;
  pgedge_vectorizer.provider 
 ----------------------------
- openai
+ ollama
 (1 row)
 
 -- Test available providers are registered (all should work)
@@ -89,6 +89,6 @@ RESET pgedge_vectorizer.model;
 SHOW pgedge_vectorizer.provider;
  pgedge_vectorizer.provider 
 ----------------------------
- openai
+ ollama
 (1 row)
 

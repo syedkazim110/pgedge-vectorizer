@@ -151,12 +151,14 @@ SELECT array_length(
 -- Test 10: BM25 tokenizer strips stopwords
 -- 'the', 'is', 'a' are stopwords; 'cat' and 'test' should remain
 ---------------------------------------------------------------------------
-SELECT pgedge_vectorizer.bm25_tokenize('the cat is a test')
-ORDER BY 1;
- bm25_tokenize 
----------------
- {cat,test}
-(1 row)
+SELECT token
+FROM unnest(pgedge_vectorizer.bm25_tokenize('the cat is a test')) AS token
+ORDER BY token;
+ token 
+-------
+ cat
+ test
+(2 rows)
 
 ---------------------------------------------------------------------------
 -- Test 11: BM25 tokenizer handles empty string

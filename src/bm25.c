@@ -146,9 +146,9 @@ bm25_tokenize(const char *text, int *ntokens)
 {
 	char       *buf;
 	char       *tok;
-	BM25Term   *terms = NULL;
+	int         cap = 1;
+	BM25Term   *terms;
 	int         nterms = 0;
-	int         cap = 0;
 	int         idx;
 
 	*ntokens = 0;
@@ -156,19 +156,21 @@ bm25_tokenize(const char *text, int *ntokens)
 	if (text == NULL || *text == '\0')
 		return palloc0(sizeof(BM25Term));
 
+	/* Pre-allocate; avoids a NULL check after the loop */
+	terms = palloc(cap * sizeof(BM25Term));
+
 	buf = pstrdup(text);
 	normalize_text_inplace(buf);
 
+	/* strtok never returns an empty token when delimiter is " " */
 	tok = strtok(buf, " ");
 	while (tok != NULL)
 	{
-		if (*tok != '\0' && !is_stopword(tok))
+		if (!is_stopword(tok))
 		{
 			idx = find_term_idx(terms, nterms, tok);
 			if (idx >= 0)
-			{
 				terms[idx].tf++;
-			}
 			else
 			{
 				if (nterms >= cap)
@@ -182,10 +184,6 @@ bm25_tokenize(const char *text, int *ntokens)
 	}
 
 	pfree(buf);
-
-	if (terms == NULL)
-		terms = palloc0(sizeof(BM25Term));
-
 	*ntokens = nterms;
 	return terms;
 }
@@ -240,9 +238,8 @@ bm25_load_idf_stats(const char *chunk_table, int *nstats)
 	*nstats = 0;
 
 	sql = psprintf(
-		"SELECT term, doc_freq, total_docs, idf_weight "
-		"FROM %s_idf_stats",
-		chunk_table);
+		"SELECT term, doc_freq, total_docs, idf_weight FROM %s",
+		quote_identifier(psprintf("%s_idf_stats", chunk_table)));
 
 	oldctx   = CurrentMemoryContext;
 	oldowner = CurrentResourceOwner;
@@ -301,7 +298,7 @@ bm25_avg_doc_len_internal(const char *chunk_table)
 	float8  result = 1.0;
 
 	sql = psprintf("SELECT AVG(length(content)) FROM %s",
-				   chunk_table);
+				   quote_identifier(chunk_table));
 	ret = SPI_execute(sql, true, 1);
 	pfree(sql);
 
@@ -496,12 +493,15 @@ bm25_compute_sparse_vector(BM25Term *tokens, int ntokens,
 static void
 upsert_term_idf(const char *chunk_table, const char *term)
 {
-	char   *safe_term = quote_literal_cstr(term);
+	char   *safe_term  = quote_literal_cstr(term);
+	const char *qt     = quote_identifier(chunk_table);
+	const char *qidf   = quote_identifier(
+							psprintf("%s_idf_stats", chunk_table));
 	char   *sql;
 	int     ret;
 
 	sql = psprintf(
-		"INSERT INTO %s_idf_stats"
+		"INSERT INTO %s"
 		"    (term, doc_freq, total_docs, idf_weight)"
 		" SELECT %s, 1, t.cnt,"
 		"        ln(1.0 + (t.cnt - 1.0 + 0.5)"
@@ -509,15 +509,15 @@ upsert_term_idf(const char *chunk_table, const char *term)
 		" FROM (SELECT count(*)::int AS cnt"
 		"       FROM %s) t"
 		" ON CONFLICT (term) DO UPDATE SET"
-		"    doc_freq   = %s_idf_stats.doc_freq + 1,"
+		"    doc_freq   = %s.doc_freq + 1,"
 		"    total_docs = EXCLUDED.total_docs,"
 		"    idf_weight = ln(1.0 +"
 		"        (EXCLUDED.total_docs"
-		"         - (%s_idf_stats.doc_freq + 1) + 0.5)"
-		"        / ((%s_idf_stats.doc_freq + 1) + 0.5)),"
+		"         - (%s.doc_freq + 1) + 0.5)"
+		"        / ((%s.doc_freq + 1) + 0.5)),"
 		"    updated_at = now()",
-		chunk_table, safe_term, chunk_table,
-		chunk_table, chunk_table, chunk_table);
+		qidf, safe_term, qt,
+		qidf, qidf, qidf);
 
 	pfree(safe_term);
 	ret = SPI_execute(sql, false, 0);
