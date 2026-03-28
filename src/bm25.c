@@ -88,6 +88,51 @@ term_to_dim(const char *term)
 }
 
 /*
+ * normalize_text_inplace — lowercase and replace non-alpha with spaces
+ */
+static void
+normalize_text_inplace(char *buf)
+{
+	char *p;
+
+	for (p = buf; *p; p++)
+	{
+		if (isalpha((unsigned char) *p))
+			*p = (char) tolower((unsigned char) *p);
+		else
+			*p = ' ';
+	}
+}
+
+/*
+ * find_term_idx — return index of tok in terms[], or -1 if not found
+ */
+static int
+find_term_idx(BM25Term *terms, int nterms, const char *tok)
+{
+	int i;
+
+	for (i = 0; i < nterms; i++)
+	{
+		if (strcmp(terms[i].term, tok) == 0)
+			return i;
+	}
+	return -1;
+}
+
+/*
+ * grow_terms — double the capacity of the terms array
+ */
+static BM25Term *
+grow_terms(BM25Term *terms, int *cap)
+{
+	*cap = (*cap == 0) ? 16 : *cap * 2;
+	if (terms == NULL)
+		return palloc(*cap * sizeof(BM25Term));
+	return repalloc(terms, *cap * sizeof(BM25Term));
+}
+
+/*
  * bm25_tokenize
  *
  * Lowercase the input, replace non-alpha chars with spaces, split on
@@ -100,67 +145,39 @@ BM25Term *
 bm25_tokenize(const char *text, int *ntokens)
 {
 	char       *buf;
-	char       *p;
 	char       *tok;
 	BM25Term   *terms = NULL;
 	int         nterms = 0;
 	int         cap = 0;
+	int         idx;
 
 	*ntokens = 0;
 
 	if (text == NULL || *text == '\0')
 		return palloc0(sizeof(BM25Term));
 
-	/* Lowercase copy; replace non-alpha chars with spaces */
 	buf = pstrdup(text);
-	for (p = buf; *p; p++)
-	{
-		if (isalpha((unsigned char) *p))
-			*p = (char) tolower((unsigned char) *p);
-		else
-			*p = ' ';
-	}
+	normalize_text_inplace(buf);
 
-	/* Tokenize and build deduplicated term list */
 	tok = strtok(buf, " ");
 	while (tok != NULL)
 	{
-		int  i;
-		bool found = false;
-
-		if (*tok == '\0' || is_stopword(tok))
+		if (*tok != '\0' && !is_stopword(tok))
 		{
-			tok = strtok(NULL, " ");
-			continue;
-		}
-
-		/* Search for existing entry (deduplication) */
-		for (i = 0; i < nterms; i++)
-		{
-			if (strcmp(terms[i].term, tok) == 0)
+			idx = find_term_idx(terms, nterms, tok);
+			if (idx >= 0)
 			{
-				terms[i].tf++;
-				found = true;
-				break;
+				terms[idx].tf++;
+			}
+			else
+			{
+				if (nterms >= cap)
+					terms = grow_terms(terms, &cap);
+				terms[nterms].term = pstrdup(tok);
+				terms[nterms].tf   = 1;
+				nterms++;
 			}
 		}
-
-		if (!found)
-		{
-			if (nterms >= cap)
-			{
-				cap = (cap == 0) ? 16 : cap * 2;
-				if (terms == NULL)
-					terms = palloc(cap * sizeof(BM25Term));
-				else
-					terms = repalloc(terms,
-									 cap * sizeof(BM25Term));
-			}
-			terms[nterms].term = pstrdup(tok);
-			terms[nterms].tf   = 1;
-			nterms++;
-		}
-
 		tok = strtok(NULL, " ");
 	}
 
@@ -183,6 +200,32 @@ bm25_tokenize(const char *text, int *ntokens)
  * Uses a subtransaction so a missing table does not abort the outer
  * worker transaction.  Caller must have an active SPI connection.
  */
+
+/*
+ * read_idf_row — extract one IdfStat from a SPI result row
+ */
+static IdfStat
+read_idf_row(SPITupleTable *tuptable, int i)
+{
+	IdfStat  s;
+	bool     isnull;
+	Datum    val;
+
+	val = SPI_getbinval(tuptable->vals[i], tuptable->tupdesc, 1, &isnull);
+	s.term = isnull ? pstrdup("") : pstrdup(TextDatumGetCString(val));
+
+	val = SPI_getbinval(tuptable->vals[i], tuptable->tupdesc, 2, &isnull);
+	s.doc_freq = isnull ? 1 : DatumGetInt32(val);
+
+	val = SPI_getbinval(tuptable->vals[i], tuptable->tupdesc, 3, &isnull);
+	s.total_docs = isnull ? 1 : DatumGetInt32(val);
+
+	val = SPI_getbinval(tuptable->vals[i], tuptable->tupdesc, 4, &isnull);
+	s.idf_weight = isnull ? 0.693 : DatumGetFloat8(val);
+
+	return s;
+}
+
 IdfStat *
 bm25_load_idf_stats(const char *chunk_table, int *nstats)
 {
@@ -235,28 +278,7 @@ bm25_load_idf_stats(const char *chunk_table, int *nstats)
 	stats = palloc(n * sizeof(IdfStat));
 
 	for (int i = 0; i < n; i++)
-	{
-		bool  isnull;
-		Datum val;
-
-		val = SPI_getbinval(SPI_tuptable->vals[i],
-							SPI_tuptable->tupdesc, 1, &isnull);
-		stats[i].term = isnull ? pstrdup("") :
-			pstrdup(TextDatumGetCString(val));
-
-		val = SPI_getbinval(SPI_tuptable->vals[i],
-							SPI_tuptable->tupdesc, 2, &isnull);
-		stats[i].doc_freq = isnull ? 1 : DatumGetInt32(val);
-
-		val = SPI_getbinval(SPI_tuptable->vals[i],
-							SPI_tuptable->tupdesc, 3, &isnull);
-		stats[i].total_docs = isnull ? 1 : DatumGetInt32(val);
-
-		val = SPI_getbinval(SPI_tuptable->vals[i],
-							SPI_tuptable->tupdesc, 4, &isnull);
-		stats[i].idf_weight = isnull ? 0.693 :
-			DatumGetFloat8(val);
-	}
+		stats[i] = read_idf_row(SPI_tuptable, i);
 
 	*nstats = n;
 	return stats;
@@ -317,6 +339,59 @@ lookup_idf(const char *term, IdfStat *stats, int nstats)
 	return log(2.0);
 }
 
+typedef struct { int dim; float8 score; } DimScore;
+
+/*
+ * accumulate_dim_score — add score to existing dim or append a new entry
+ */
+static void
+accumulate_dim_score(DimScore **pairs, int *npairs, int *cap,
+					 int dim, float8 score)
+{
+	for (int j = 0; j < *npairs; j++)
+	{
+		if ((*pairs)[j].dim == dim)
+		{
+			(*pairs)[j].score += score;
+			return;
+		}
+	}
+
+	if (*npairs >= *cap)
+	{
+		*cap = (*cap == 0) ? 16 : *cap * 2;
+		if (*pairs == NULL)
+			*pairs = palloc(*cap * sizeof(DimScore));
+		else
+			*pairs = repalloc(*pairs, *cap * sizeof(DimScore));
+	}
+	(*pairs)[*npairs].dim   = dim;
+	(*pairs)[*npairs].score = score;
+	(*npairs)++;
+}
+
+/*
+ * build_sparsevec_string — format DimScore pairs as "{d:s,...}/N"
+ */
+static char *
+build_sparsevec_string(DimScore *pairs, int npairs)
+{
+	StringInfoData  buf;
+	bool            first = true;
+
+	initStringInfo(&buf);
+	appendStringInfoChar(&buf, '{');
+	for (int i = 0; i < npairs; i++)
+	{
+		if (!first)
+			appendStringInfoChar(&buf, ',');
+		appendStringInfo(&buf, "%d:%f", pairs[i].dim, pairs[i].score);
+		first = false;
+	}
+	appendStringInfo(&buf, "}/%d", BM25_VOCAB_SIZE);
+	return buf.data;
+}
+
 /*
  * bm25_compute_sparse_str
  *
@@ -333,14 +408,11 @@ bm25_compute_sparse_str(BM25Term *tokens, int ntokens,
 						float8 k1, float8 b,
 						float8 avg_doc_len, int doc_len)
 {
-	typedef struct { int dim; float8 score; } DimScore;
-
-	DimScore       *pairs = NULL;
-	int             npairs = 0;
-	int             cap = 0;
-	StringInfoData  buf;
-	bool            first = true;
-	float8          dl_ratio;
+	DimScore   *pairs = NULL;
+	int         npairs = 0;
+	int         cap = 0;
+	float8      dl_ratio;
+	char       *result;
 
 	if (avg_doc_len <= 0.0)
 		avg_doc_len = 1.0;
@@ -348,71 +420,23 @@ bm25_compute_sparse_str(BM25Term *tokens, int ntokens,
 
 	for (int i = 0; i < ntokens; i++)
 	{
-		float8  idf;
-		float8  tf;
-		float8  denom;
-		float8  score;
-		int     dim;
-		bool    found = false;
+		float8  tf    = (float8) tokens[i].tf;
+		float8  idf   = lookup_idf(tokens[i].term, stats, nstats);
+		float8  denom = tf + k1 * (1.0 - b + b * dl_ratio);
+		float8  score = (denom <= 0.0) ? 0.0 :
+						idf * (tf * (k1 + 1.0)) / denom;
 
-		idf   = lookup_idf(tokens[i].term, stats, nstats);
-		tf    = (float8) tokens[i].tf;
-		denom = tf + k1 * (1.0 - b + b * dl_ratio);
-		score = (denom <= 0.0) ? 0.0 :
-				idf * (tf * (k1 + 1.0)) / denom;
-
-		if (score <= 0.0)
-			continue;
-
-		dim = term_to_dim(tokens[i].term);
-
-		/* Merge into existing pair if dimension already recorded */
-		for (int j = 0; j < npairs; j++)
-		{
-			if (pairs[j].dim == dim)
-			{
-				pairs[j].score += score;
-				found = true;
-				break;
-			}
-		}
-
-		if (!found)
-		{
-			if (npairs >= cap)
-			{
-				cap = (cap == 0) ? 16 : cap * 2;
-				if (pairs == NULL)
-					pairs = palloc(cap * sizeof(DimScore));
-				else
-					pairs = repalloc(pairs,
-									 cap * sizeof(DimScore));
-			}
-			pairs[npairs].dim   = dim;
-			pairs[npairs].score = score;
-			npairs++;
-		}
+		if (score > 0.0)
+			accumulate_dim_score(&pairs, &npairs, &cap,
+								 term_to_dim(tokens[i].term), score);
 	}
 
-	/* Build the sparsevec string representation */
-	initStringInfo(&buf);
-	appendStringInfoChar(&buf, '{');
-
-	for (int i = 0; i < npairs; i++)
-	{
-		if (!first)
-			appendStringInfoChar(&buf, ',');
-		appendStringInfo(&buf, "%d:%f",
-						 pairs[i].dim, pairs[i].score);
-		first = false;
-	}
-
-	appendStringInfo(&buf, "}/%d", BM25_VOCAB_SIZE);
+	result = build_sparsevec_string(pairs, npairs);
 
 	if (pairs != NULL)
 		pfree(pairs);
 
-	return buf.data;
+	return result;
 }
 
 /*
@@ -466,6 +490,45 @@ bm25_compute_sparse_vector(BM25Term *tokens, int ntokens,
  * so that a failure does not abort the outer worker transaction.
  * Caller must have an active SPI connection.
  */
+/*
+ * upsert_term_idf — insert or update a single term's IDF stats row
+ */
+static void
+upsert_term_idf(const char *chunk_table, const char *term)
+{
+	char   *safe_term = quote_literal_cstr(term);
+	char   *sql;
+	int     ret;
+
+	sql = psprintf(
+		"INSERT INTO %s_idf_stats"
+		"    (term, doc_freq, total_docs, idf_weight)"
+		" SELECT %s, 1, t.cnt,"
+		"        ln(1.0 + (t.cnt - 1.0 + 0.5)"
+		"               / (1.0 + 0.5))"
+		" FROM (SELECT count(*)::int AS cnt"
+		"       FROM %s) t"
+		" ON CONFLICT (term) DO UPDATE SET"
+		"    doc_freq   = %s_idf_stats.doc_freq + 1,"
+		"    total_docs = EXCLUDED.total_docs,"
+		"    idf_weight = ln(1.0 +"
+		"        (EXCLUDED.total_docs"
+		"         - (%s_idf_stats.doc_freq + 1) + 0.5)"
+		"        / ((%s_idf_stats.doc_freq + 1) + 0.5)),"
+		"    updated_at = now()",
+		chunk_table, safe_term, chunk_table,
+		chunk_table, chunk_table, chunk_table);
+
+	pfree(safe_term);
+	ret = SPI_execute(sql, false, 0);
+	pfree(sql);
+
+	if (ret != SPI_OK_INSERT && ret != SPI_OK_UPDATE)
+		elog(WARNING,
+			 "bm25_update_idf_stats: unexpected SPI result %d "
+			 "for term in table %s", ret, chunk_table);
+}
+
 void
 bm25_update_idf_stats(const char *chunk_table,
 					  BM25Term *tokens, int ntokens)
@@ -483,49 +546,7 @@ bm25_update_idf_stats(const char *chunk_table,
 	PG_TRY();
 	{
 		for (int i = 0; i < ntokens; i++)
-		{
-			char   *safe_term;
-			char   *sql;
-			int     ret;
-
-			/*
-			 * quote_literal_cstr produces a properly SQL-escaped
-			 * literal string including surrounding single quotes.
-			 * Terms from bm25_tokenize contain only lowercase
-			 * alpha, but we escape defensively.
-			 */
-			safe_term = quote_literal_cstr(tokens[i].term);
-
-			sql = psprintf(
-				"INSERT INTO %s_idf_stats"
-				"    (term, doc_freq, total_docs, idf_weight)"
-				" SELECT %s, 1, t.cnt,"
-				"        ln(1.0 + (t.cnt - 1.0 + 0.5)"
-				"               / (1.0 + 0.5))"
-				" FROM (SELECT count(*)::int AS cnt"
-				"       FROM %s) t"
-				" ON CONFLICT (term) DO UPDATE SET"
-				"    doc_freq   = %s_idf_stats.doc_freq + 1,"
-				"    total_docs = EXCLUDED.total_docs,"
-				"    idf_weight = ln(1.0 +"
-				"        (EXCLUDED.total_docs"
-				"         - (%s_idf_stats.doc_freq + 1) + 0.5)"
-				"        / ((%s_idf_stats.doc_freq + 1) + 0.5)),"
-				"    updated_at = now()",
-				chunk_table, safe_term, chunk_table,
-				chunk_table, chunk_table, chunk_table);
-
-			pfree(safe_term);
-
-			ret = SPI_execute(sql, false, 0);
-			pfree(sql);
-
-			if (ret != SPI_OK_INSERT && ret != SPI_OK_UPDATE)
-				elog(WARNING,
-					 "bm25_update_idf_stats: unexpected SPI "
-					 "result %d for term in table %s",
-					 ret, chunk_table);
-		}
+			upsert_term_idf(chunk_table, tokens[i].term);
 
 		ReleaseCurrentSubTransaction();
 	}
@@ -596,7 +617,7 @@ pgedge_vectorizer_bm25_query_vector(PG_FUNCTION_ARGS)
 				 pgedge_vectorizer_bm25_k1,
 				 pgedge_vectorizer_bm25_b,
 				 avg_doc_len,
-				 (int) strlen(query));
+				 (int) VARSIZE_ANY_EXHDR(query_text));
 
 	SPI_finish();
 

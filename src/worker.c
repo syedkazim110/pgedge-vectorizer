@@ -545,12 +545,14 @@ process_queue_batch(int worker_id)
 						{
 							int			ntokens;
 							int			nstats;
+							int			content_len;
 							BM25Term   *tokens;
 							IdfStat	   *stats;
 							float8		avg_doc_len;
 							char	   *sparse_str;
 							int			ret_bm25;
 
+							content_len = (int) strlen(contents[idx]);
 							tokens = bm25_tokenize(contents[idx],
 												  &ntokens);
 							stats = bm25_load_idf_stats(
@@ -563,7 +565,7 @@ process_queue_batch(int worker_id)
 									pgedge_vectorizer_bm25_k1,
 									pgedge_vectorizer_bm25_b,
 									avg_doc_len,
-									(int) strlen(contents[idx]));
+									content_len);
 
 							ret_bm25 = SPI_execute(
 								psprintf(
