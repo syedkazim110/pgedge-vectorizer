@@ -1,0 +1,204 @@
+-- hybrid_test.sql
+-- Regression tests for hybrid BM25 + dense vector search feature.
+---------------------------------------------------------------------------
+-- Setup
+---------------------------------------------------------------------------
+CREATE TABLE hybrid_test_docs (
+    id      BIGSERIAL PRIMARY KEY,
+    content TEXT
+);
+-- Use a fixed embedding dimension to avoid needing an API key
+SELECT pgedge_vectorizer.enable_vectorization(
+    'hybrid_test_docs'::regclass,
+    'content',
+    'token_based',
+    100,
+    10,
+    1536
+);
+NOTICE:  Using primary key column: id (bigint)
+NOTICE:  column "sparse_embedding" of relation "hybrid_test_docs_content_chunks" already exists, skipping
+NOTICE:  column "bm25_doc_len" of relation "hybrid_test_docs_content_chunks" already exists, skipping
+NOTICE:  Vectorization enabled: hybrid_test_docs -> hybrid_test_docs_content_chunks
+NOTICE:  Strategy: token_based, chunk_size: 100, overlap: 10
+NOTICE:  Processing existing rows...
+NOTICE:  Processed 0 existing rows
+ enable_vectorization 
+----------------------
+ 
+(1 row)
+
+---------------------------------------------------------------------------
+-- Test 1: GUC parameters exist
+---------------------------------------------------------------------------
+-- Verify all three hybrid GUC params are registered
+SELECT name
+FROM pg_settings
+WHERE name IN (
+    'pgedge_vectorizer.enable_hybrid',
+    'pgedge_vectorizer.bm25_k1',
+    'pgedge_vectorizer.bm25_b'
+)
+ORDER BY name;
+              name               
+---------------------------------
+ pgedge_vectorizer.bm25_b
+ pgedge_vectorizer.bm25_k1
+ pgedge_vectorizer.enable_hybrid
+(3 rows)
+
+---------------------------------------------------------------------------
+-- Test 2: sparse_embedding column exists in chunk table
+---------------------------------------------------------------------------
+SELECT column_name, data_type
+FROM information_schema.columns
+WHERE table_name   = 'hybrid_test_docs_content_chunks'
+  AND column_name  = 'sparse_embedding';
+   column_name    |  data_type   
+------------------+--------------
+ sparse_embedding | USER-DEFINED
+(1 row)
+
+---------------------------------------------------------------------------
+-- Test 3: bm25_doc_len generated column exists in chunk table
+---------------------------------------------------------------------------
+SELECT column_name, is_generated
+FROM information_schema.columns
+WHERE table_name  = 'hybrid_test_docs_content_chunks'
+  AND column_name = 'bm25_doc_len';
+ column_name  | is_generated 
+--------------+--------------
+ bm25_doc_len | ALWAYS
+(1 row)
+
+---------------------------------------------------------------------------
+-- Test 4: IDF stats table was created
+---------------------------------------------------------------------------
+SELECT tablename
+FROM pg_tables
+WHERE tablename = 'hybrid_test_docs_content_chunks_idf_stats';
+                 tablename                 
+-------------------------------------------
+ hybrid_test_docs_content_chunks_idf_stats
+(1 row)
+
+---------------------------------------------------------------------------
+-- Test 5: HNSW sparse index was created
+---------------------------------------------------------------------------
+SELECT indexname
+FROM pg_indexes
+WHERE tablename = 'hybrid_test_docs_content_chunks'
+  AND indexname LIKE '%sparse%';
+                 indexname                  
+--------------------------------------------
+ hybrid_test_docs_content_chunks_sparse_idx
+(1 row)
+
+---------------------------------------------------------------------------
+-- Test 6: vectorizers registry was populated
+---------------------------------------------------------------------------
+SELECT source_table, source_column, chunk_table
+FROM pgedge_vectorizer.vectorizers
+WHERE source_table = 'hybrid_test_docs';
+   source_table   | source_column |           chunk_table           
+------------------+---------------+---------------------------------
+ hybrid_test_docs | content       | hybrid_test_docs_content_chunks
+(1 row)
+
+---------------------------------------------------------------------------
+-- Test 7: hybrid_search function exists
+---------------------------------------------------------------------------
+SELECT proname
+FROM pg_proc
+WHERE proname = 'hybrid_search'
+  AND pronamespace = (
+      SELECT oid FROM pg_namespace
+      WHERE nspname = 'pgedge_vectorizer'
+  );
+    proname    
+---------------
+ hybrid_search
+(1 row)
+
+---------------------------------------------------------------------------
+-- Test 8: hybrid_search_simple function exists
+---------------------------------------------------------------------------
+SELECT proname
+FROM pg_proc
+WHERE proname = 'hybrid_search_simple'
+  AND pronamespace = (
+      SELECT oid FROM pg_namespace
+      WHERE nspname = 'pgedge_vectorizer'
+  );
+       proname        
+----------------------
+ hybrid_search_simple
+(1 row)
+
+---------------------------------------------------------------------------
+-- Test 9: BM25 tokenizer returns non-empty output for normal text
+---------------------------------------------------------------------------
+SELECT array_length(
+    pgedge_vectorizer.bm25_tokenize('the quick brown fox jumps'),
+    1
+) > 0 AS has_tokens;
+ has_tokens 
+------------
+ t
+(1 row)
+
+---------------------------------------------------------------------------
+-- Test 10: BM25 tokenizer strips stopwords
+-- 'the', 'is', 'a' are stopwords; 'cat' and 'test' should remain
+---------------------------------------------------------------------------
+SELECT pgedge_vectorizer.bm25_tokenize('the cat is a test')
+ORDER BY 1;
+ bm25_tokenize 
+---------------
+ {cat,test}
+(1 row)
+
+---------------------------------------------------------------------------
+-- Test 11: BM25 tokenizer handles empty string
+---------------------------------------------------------------------------
+SELECT COALESCE(
+    array_length(pgedge_vectorizer.bm25_tokenize(''), 1),
+    0
+) AS token_count;
+ token_count 
+-------------
+           0
+(1 row)
+
+---------------------------------------------------------------------------
+-- Test 12: hybrid_search raises a clear exception for unknown table
+---------------------------------------------------------------------------
+DO $$
+BEGIN
+    PERFORM pgedge_vectorizer.hybrid_search(
+        'pg_class'::regclass, 'test query', 5
+    );
+    RAISE EXCEPTION 'Expected exception was not raised';
+EXCEPTION
+    WHEN OTHERS THEN
+        IF sqlerrm LIKE '%No vectorizer found%' THEN
+            RAISE NOTICE 'Got expected exception: %', sqlerrm;
+        ELSE
+            RAISE;
+        END IF;
+END;
+$$;
+NOTICE:  Got expected exception: No vectorizer found for table pg_class. Call pgedge_vectorizer.enable_vectorization() first.
+---------------------------------------------------------------------------
+-- Cleanup
+---------------------------------------------------------------------------
+SELECT pgedge_vectorizer.disable_vectorization(
+    'hybrid_test_docs'::regclass, 'content', true
+);
+NOTICE:  Vectorization disabled and chunk table dropped: hybrid_test_docs_content_chunks
+ disable_vectorization 
+-----------------------
+ 
+(1 row)
+
+DROP TABLE hybrid_test_docs;

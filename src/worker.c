@@ -11,6 +11,7 @@
  *-------------------------------------------------------------------------
  */
 #include "pgedge_vectorizer.h"
+#include "bm25.h"
 
 #include <time.h>
 
@@ -535,6 +536,57 @@ process_queue_batch(int worker_id)
 					PG_TRY();
 					{
 						update_embedding(chunk_ids[idx], chunk_tables[idx], embeddings[i], dim);
+
+						/*
+						 * BM25 sparse vector update (opt-in via
+						 * pgedge_vectorizer.enable_hybrid GUC).
+						 */
+						if (pgedge_vectorizer_enable_hybrid)
+						{
+							int			ntokens;
+							int			nstats;
+							BM25Term   *tokens;
+							IdfStat	   *stats;
+							float8		avg_doc_len;
+							char	   *sparse_str;
+							int			ret_bm25;
+
+							tokens = bm25_tokenize(contents[idx],
+												  &ntokens);
+							stats = bm25_load_idf_stats(
+									chunk_tables[idx], &nstats);
+							avg_doc_len = bm25_avg_doc_len_internal(
+									chunk_tables[idx]);
+							sparse_str = bm25_compute_sparse_str(
+									tokens, ntokens,
+									stats,  nstats,
+									pgedge_vectorizer_bm25_k1,
+									pgedge_vectorizer_bm25_b,
+									avg_doc_len,
+									(int) strlen(contents[idx]));
+
+							ret_bm25 = SPI_execute(
+								psprintf(
+									"UPDATE %s SET "
+									"sparse_embedding = "
+									"'%s'::sparsevec "
+									"WHERE id = %ld",
+									chunk_tables[idx],
+									sparse_str,
+									chunk_ids[idx]),
+								false, 0);
+
+							if (ret_bm25 != SPI_OK_UPDATE)
+								elog(WARNING,
+									 "Failed to update "
+									 "sparse_embedding for "
+									 "chunk " INT64_FORMAT,
+									 chunk_ids[idx]);
+
+							bm25_update_idf_stats(
+								chunk_tables[idx],
+								tokens, ntokens);
+						}
 
 						/* Mark as completed */
 						SPI_execute(psprintf(

@@ -66,6 +66,62 @@ from data insertion to embedding storage:
 
 
 
+## Hybrid Search
+
+Hybrid search combines BM25 sparse keyword ranking with dense vector similarity
+and merges the two result lists via **Reciprocal Rank Fusion (RRF)**. It excels
+at queries containing specific terms or proper nouns where dense-only retrieval
+may miss exact matches.
+
+### Enabling Hybrid Search
+
+Add to `postgresql.conf` and reload (`SELECT pg_reload_conf()`):
+
+```ini
+pgedge_vectorizer.enable_hybrid = true
+
+# Optional tuning (defaults shown)
+pgedge_vectorizer.bm25_k1 = 1.2    # term-frequency saturation (0.0–3.0)
+pgedge_vectorizer.bm25_b  = 0.75   # length normalization (0.0–1.0)
+```
+
+Once enabled, background workers automatically populate a `sparse_embedding`
+column in each chunk table and maintain a `_idf_stats` table of per-term
+document frequencies.
+
+### Usage Example
+
+```sql
+-- Enable vectorization (unchanged from normal workflow)
+SELECT pgedge_vectorizer.enable_vectorization(
+    source_table  := 'articles',
+    source_column := 'content'
+);
+
+-- Hybrid search with RRF fusion
+SELECT source_id, chunk, dense_rank, sparse_rank, rrf_score
+FROM pgedge_vectorizer.hybrid_search(
+    p_source_table := 'articles'::regclass,
+    p_query        := 'keyword ranking BM25',
+    p_limit        := 10,
+    p_alpha        := 0.7,   -- weight of dense results (0–1)
+    p_rrf_k        := 60     -- RRF smoothing constant
+);
+
+-- Convenience wrapper
+SELECT * FROM pgedge_vectorizer.hybrid_search_simple(
+    'articles'::regclass, 'vector similarity search', 5
+);
+```
+
+### Hybrid Search GUC Parameters
+
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
+| `pgedge_vectorizer.enable_hybrid` | `false` | — | Enable BM25 sparse vectors |
+| `pgedge_vectorizer.bm25_k1` | `1.2` | `0.0–3.0` | Term frequency saturation |
+| `pgedge_vectorizer.bm25_b` | `0.75` | `0.0–1.0` | Document length normalization |
+
 For more information or to download Vectorizer visit:
 
 - **GitHub**: https://github.com/pgEdge/pgedge-vectorizer

@@ -8,6 +8,7 @@ EXTVERSION = 1.0
 MODULE_big = $(EXTENSION)
 OBJS = src/pgedge_vectorizer.o \
        src/guc.o \
+       src/bm25.o \
        src/chunking.o \
        src/hybrid_chunking.o \
        src/tokenizer.o \
@@ -24,10 +25,11 @@ DATA = sql/$(EXTENSION)--$(EXTVERSION).sql \
        sql/$(EXTENSION)--1.0-beta3.sql \
        sql/$(EXTENSION)--1.0-beta1--1.0-beta2.sql \
        sql/$(EXTENSION)--1.0-beta2--1.0-beta3.sql \
-       sql/$(EXTENSION)--1.0-beta3--1.0.sql
+       sql/$(EXTENSION)--1.0-beta3--1.0.sql \
+       sql/hybrid.sql
 
 # Test configuration for pg_regress
-REGRESS = setup chunking hybrid_chunking queue vectorization multi_column maintenance edge_cases providers worker cleanup embedding pk_types stale_embeddings
+REGRESS = setup chunking hybrid_chunking queue vectorization multi_column maintenance edge_cases providers worker cleanup embedding pk_types stale_embeddings hybrid_test
 REGRESS_OPTS = --inputdir=test --outputdir=test
 
 # Documentation files (if any)
@@ -35,7 +37,7 @@ REGRESS_OPTS = --inputdir=test --outputdir=test
 
 # Compiler and linker flags
 PG_CPPFLAGS = -I$(srcdir)/src
-SHLIB_LINK = -lcurl
+SHLIB_LINK = -lcurl -lm
 
 # For systems with libcurl in non-standard locations
 # Uncomment and adjust if needed:
