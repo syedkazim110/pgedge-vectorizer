@@ -367,7 +367,8 @@ process_queue_batch(int worker_id)
 
 	/* Fetch pending items using FOR UPDATE SKIP LOCKED */
 	ret = SPI_execute(psprintf(
-		"SELECT id, chunk_id, chunk_table, content, attempts, max_attempts "
+		"SELECT id, chunk_id, chunk_table, content, attempts, max_attempts, "
+		"       COALESCE((metadata->>'sparse_only')::boolean, false) AS sparse_only "
 		"FROM pgedge_vectorizer.queue "
 		"WHERE status = 'pending' "
 		"AND (next_retry_at IS NULL OR next_retry_at <= NOW()) "
@@ -387,9 +388,11 @@ process_queue_batch(int worker_id)
 		int *content_lens = palloc(n_items * sizeof(int));
 		int *attempts = palloc(n_items * sizeof(int));
 		int *max_attempts = palloc(n_items * sizeof(int));
+		bool *sparse_only = palloc(n_items * sizeof(bool));
 		float **embeddings = NULL;
 		int dim = 0;
 		bool has_retries = false;
+		bool has_sparse_only = false;
 		int effective_batch_size = n_items;
 
 		elog(DEBUG1, "Worker %d processing %d queue items", worker_id + 1, n_items);
@@ -419,8 +422,35 @@ process_queue_batch(int worker_id)
 			val = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 6, &isnull);
 			max_attempts[i] = DatumGetInt32(val);
 
+			val = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 7, &isnull);
+			sparse_only[i] = (!isnull && DatumGetBool(val));
+
 			if (attempts[i] > 0)
 				has_retries = true;
+		}
+
+		/* Dense embedding already present means this item can be sparse-only. */
+		for (int i = 0; i < n_items; i++)
+		{
+			bool	isnull = false;
+			int		ret_dense;
+			Datum	val;
+
+			ret_dense = SPI_execute(psprintf(
+				"SELECT embedding IS NOT NULL FROM %s WHERE id = %ld",
+				quote_identifier(chunk_tables[i]),
+				chunk_ids[i]),
+				true, 1);
+
+			if (ret_dense == SPI_OK_SELECT && SPI_processed == 1)
+			{
+				val = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+				if (!isnull && DatumGetBool(val))
+					sparse_only[i] = true;
+			}
+
+			if (sparse_only[i])
+				has_sparse_only = true;
 		}
 
 		/* If any items have been retried, process individually to isolate failures */
@@ -428,6 +458,11 @@ process_queue_batch(int worker_id)
 		{
 			effective_batch_size = 1;
 			elog(DEBUG1, "Worker %d: found retried items, processing individually", worker_id + 1);
+		}
+		else if (has_sparse_only && n_items > 1)
+		{
+			effective_batch_size = 1;
+			elog(DEBUG1, "Worker %d: found sparse-only items, processing individually", worker_id + 1);
 		}
 
 		/* Mark all as processing */
@@ -466,8 +501,32 @@ process_queue_batch(int worker_id)
 				batch_end = n_items;
 			batch_count = batch_end - batch_start;
 
-			/* Generate embeddings for this batch */
-			embeddings = provider->generate_batch(&contents[batch_start], batch_count, &dim, &error_msg);
+			/* Skip dense generation when every item in this batch is sparse-only. */
+			{
+				bool batch_sparse_only = true;
+
+				for (int i = 0; i < batch_count; i++)
+				{
+					int idx = batch_start + i;
+					if (!sparse_only[idx])
+					{
+						batch_sparse_only = false;
+						break;
+					}
+				}
+
+				if (batch_sparse_only)
+				{
+					embeddings = palloc0(batch_count * sizeof(float *));
+					dim = 0;
+					error_msg = NULL;
+				}
+				else
+				{
+					/* Generate embeddings for this batch */
+					embeddings = provider->generate_batch(&contents[batch_start], batch_count, &dim, &error_msg);
+				}
+			}
 
 			if (embeddings != NULL)
 			{
@@ -475,6 +534,7 @@ process_queue_batch(int worker_id)
 				 * Validate that the embedding dimension matches the chunk
 				 * table's vector column. Check once per batch.
 				 */
+				if (!sparse_only[batch_start])
 				{
 					int idx0 = batch_start;
 					int ret_dim;
@@ -537,7 +597,10 @@ process_queue_batch(int worker_id)
 					int idx = batch_start + i;
 					PG_TRY();
 					{
-						update_embedding(chunk_ids[idx], chunk_tables[idx], embeddings[i], dim);
+						if (!sparse_only[idx])
+							update_embedding(chunk_ids[idx], chunk_tables[idx], embeddings[i], dim);
+						else if (!pgedge_vectorizer_enable_hybrid)
+							elog(ERROR, "cannot process sparse-only queue item while pgedge_vectorizer.enable_hybrid is disabled");
 
 						/*
 						 * BM25 sparse vector update (opt-in via
@@ -756,6 +819,7 @@ process_queue_batch(int worker_id)
 		pfree(contents);
 		pfree(attempts);
 		pfree(max_attempts);
+		pfree(sparse_only);
 	}
 
 	SPI_finish();

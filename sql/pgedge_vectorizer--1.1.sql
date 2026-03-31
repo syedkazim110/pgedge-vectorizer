@@ -146,7 +146,6 @@ CREATE FUNCTION pgedge_vectorizer.enable_vectorization(
 ) RETURNS VOID AS $$
 DECLARE
     chunk_table TEXT;
-    v_source_relname TEXT;
     trigger_name TEXT;
     actual_strategy TEXT;
     actual_chunk_size INT;
@@ -214,12 +213,10 @@ BEGIN
     RAISE NOTICE 'Using primary key column: % (%)', source_pk, pk_col_type;
 
     -- Determine chunk table name.
-    -- Use the unqualified relname so that schema-qualified source tables
-    -- (e.g. myschema.docs → relname = 'docs') produce a simple identifier
-    -- that %I can quote correctly.  Custom chunk_table_name is kept as-is.
-    SELECT relname INTO v_source_relname FROM pg_class WHERE oid = source_table;
+    -- Include source schema in the generated identifier text to avoid
+    -- collisions when two schemas have the same relname.
     chunk_table := COALESCE(chunk_table_name,
-                            v_source_relname || '_' || source_column || '_chunks');
+                            source_table::TEXT || '_' || source_column || '_chunks');
 
     -- Create chunks table
     -- Note: pk_col_type uses %s (not %I) because format_type() returns
@@ -450,17 +447,17 @@ BEGIN
             RAISE NOTICE 'Dropped trigger: %', trigger_rec.tgname;
         END LOOP;
 
-        -- Remove orphaned queue items for all chunk tables of this source
-        DELETE FROM pgedge_vectorizer.queue q
-        WHERE q.chunk_table LIKE source_table::TEXT || '_%_chunks'
-        AND q.status IN ('pending', 'processing');
-
         -- Collect chunk table names before deleting registry entries
         SELECT ARRAY(
             SELECT v.chunk_table
             FROM pgedge_vectorizer.vectorizers v
             WHERE v.source_table = source_table::TEXT
         ) INTO chunk_tables_to_drop;
+
+        -- Remove orphaned queue items for exact chunk tables from registry.
+        DELETE FROM pgedge_vectorizer.queue q
+        WHERE q.chunk_table = ANY(COALESCE(chunk_tables_to_drop, '{}'))
+        AND q.status IN ('pending', 'processing');
 
         -- Remove all vectorizer registry entries for this source table
         EXECUTE
@@ -489,7 +486,8 @@ COMMENT ON FUNCTION pgedge_vectorizer.disable_vectorization IS
 -- overcount of IDF stats when documents are updated.
 CREATE OR REPLACE FUNCTION pgedge_vectorizer.bm25_decrement_idf_stats(
     p_chunk_table TEXT,
-    p_terms       TEXT[]
+    p_terms       TEXT[],
+    p_deleted_chunks_count INT DEFAULT 1
 ) RETURNS VOID AS $$
 DECLARE
     new_total INT;
@@ -498,24 +496,29 @@ BEGIN
         RETURN;
     END IF;
 
+    IF p_deleted_chunks_count IS NULL OR p_deleted_chunks_count <= 0 THEN
+        RETURN;
+    END IF;
+
     -- Count chunks BEFORE the deletion so new_total reflects the post-delete
-    -- corpus size (current count minus the one document being removed).
-    EXECUTE format('SELECT GREATEST(count(*)::int - 1, 0) FROM %I', p_chunk_table)
-    INTO new_total;
+    -- corpus size after deleting the current document's chunks.
+    EXECUTE format('SELECT GREATEST(count(*)::int - $1, 0) FROM %I', p_chunk_table)
+    INTO new_total
+    USING p_deleted_chunks_count;
 
     EXECUTE format(
         'UPDATE %I SET'
-        '    doc_freq   = GREATEST(doc_freq - 1, 0),'
+        '    doc_freq   = GREATEST(doc_freq - $2, 0),'
         '    total_docs = $1,'
         '    idf_weight = CASE'
-        '                     WHEN GREATEST(doc_freq - 1, 0) <= 0 THEN 0.0'
-        '                     ELSE ln(1.0 + ($1::float8 - GREATEST(doc_freq - 1, 0) + 0.5)'
-        '                                  / (GREATEST(doc_freq - 1, 0) + 0.5))'
+        '                     WHEN GREATEST(doc_freq - $2, 0) <= 0 THEN 0.0'
+        '                     ELSE ln(1.0 + ($1::float8 - GREATEST(doc_freq - $2, 0) + 0.5)'
+        '                                  / (GREATEST(doc_freq - $2, 0) + 0.5))'
         '                 END,'
         '    updated_at = now()'
-        ' WHERE term = ANY($2)',
+        ' WHERE term = ANY($3)',
         p_chunk_table || '_idf_stats')
-    USING new_total, p_terms;
+    USING new_total, p_deleted_chunks_count, p_terms;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -539,6 +542,7 @@ DECLARE
     i INT;
     chunk_id BIGINT;
     source_id_val TEXT;
+    deleted_chunks_count INT := 0;
 BEGIN
     -- Extract trigger arguments
     content_col := TG_ARGV[0];
@@ -589,7 +593,15 @@ BEGIN
             END IF;
             IF old_content_for_idf IS NOT NULL AND old_content_for_idf <> '' THEN
                 old_terms := pgedge_vectorizer.bm25_tokenize(old_content_for_idf);
-                PERFORM pgedge_vectorizer.bm25_decrement_idf_stats(chunk_table, old_terms);
+                EXECUTE format(
+                    'SELECT count(*)::int FROM %I WHERE source_id = $1::%s',
+                    chunk_table, pk_type
+                )
+                INTO deleted_chunks_count
+                USING source_id_val;
+
+                PERFORM pgedge_vectorizer.bm25_decrement_idf_stats(
+                    chunk_table, old_terms, deleted_chunks_count);
             END IF;
         END;
     END IF;
@@ -789,14 +801,21 @@ CREATE FUNCTION pgedge_vectorizer.recreate_chunks(
 ) RETURNS INT AS $$
 DECLARE
     chunk_table_name TEXT;
-    v_source_relname TEXT;
     rows_affected INT := 0;
     trigger_name TEXT;
     trigger_exists BOOLEAN;
 BEGIN
-    -- Use the unqualified relname to avoid schema-prefix issues with %I.
-    SELECT relname INTO v_source_relname FROM pg_class WHERE oid = source_table_name;
-    chunk_table_name := v_source_relname || '_' || source_column_name || '_chunks';
+    -- Prefer authoritative mapping from vectorizers registry.
+    SELECT v.chunk_table
+    INTO chunk_table_name
+    FROM pgedge_vectorizer.vectorizers v
+    WHERE v.source_table = source_table_name::TEXT
+      AND v.source_column = source_column_name;
+
+    -- Fallback to legacy default naming if no registry row exists.
+    IF chunk_table_name IS NULL THEN
+        chunk_table_name := source_table_name::TEXT || '_' || source_column_name || '_chunks';
+    END IF;
 
     -- Verify chunk table exists
     IF to_regclass(chunk_table_name) IS NULL THEN
@@ -976,6 +995,11 @@ DECLARE
     v_query_dense  vector;
     v_query_sparse sparsevec;
 BEGIN
+    IF COALESCE(current_setting('pgedge_vectorizer.enable_hybrid', true), 'false')::boolean IS NOT TRUE THEN
+        RAISE EXCEPTION
+            'Hybrid search is disabled. Set pgedge_vectorizer.enable_hybrid = true and allow workers to populate sparse_embedding.';
+    END IF;
+
     -- Look up the chunk table from the vectorizers registry.
     -- When p_source_column is provided, use the exact mapping.
     -- When NULL, raise an exception if the table has more than one

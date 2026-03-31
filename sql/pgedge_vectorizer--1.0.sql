@@ -13,24 +13,6 @@
 CREATE SCHEMA IF NOT EXISTS pgedge_vectorizer;
 
 ---------------------------------------------------------------------------
--- Vectorizers registry
--- Tracks which chunk tables have been created for source tables.
--- Used by hybrid_search() to resolve chunk table names.
----------------------------------------------------------------------------
-
-CREATE TABLE pgedge_vectorizer.vectorizers (
-    id            BIGSERIAL PRIMARY KEY,
-    source_table  TEXT NOT NULL,
-    source_column NAME NOT NULL,
-    chunk_table   TEXT NOT NULL,
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (source_table, source_column)
-);
-
-COMMENT ON TABLE pgedge_vectorizer.vectorizers IS
-'Registry of active vectorizer configurations (source table → chunk table)';
-
----------------------------------------------------------------------------
 -- Queue table for async embedding generation
 ---------------------------------------------------------------------------
 
@@ -96,39 +78,6 @@ LANGUAGE C STRICT;
 COMMENT ON FUNCTION pgedge_vectorizer.detect_embedding_dimension IS
 'Detect the embedding dimension of the currently configured provider/model';
 
--- BM25 query vector function
--- Tokenizes the query and computes a sparse vector using current IDF stats.
--- Used by hybrid_search() for the query-side sparse representation.
-CREATE FUNCTION pgedge_vectorizer.bm25_query_vector(
-    query TEXT,
-    chunk_table TEXT
-) RETURNS sparsevec
-AS 'MODULE_PATHNAME', 'pgedge_vectorizer_bm25_query_vector'
-LANGUAGE C STRICT;
-
-COMMENT ON FUNCTION pgedge_vectorizer.bm25_query_vector IS
-'Compute a BM25 sparse vector for a query text using IDF stats from the given chunk table';
-
--- BM25 average document length helper
-CREATE FUNCTION pgedge_vectorizer.bm25_avg_doc_len(
-    chunk_table TEXT
-) RETURNS FLOAT8
-AS 'MODULE_PATHNAME', 'pgedge_vectorizer_bm25_avg_doc_len'
-LANGUAGE C STRICT;
-
-COMMENT ON FUNCTION pgedge_vectorizer.bm25_avg_doc_len IS
-'Return the average document length (in tokens) for the given chunk table';
-
--- BM25 tokenizer (exposed for testing)
-CREATE FUNCTION pgedge_vectorizer.bm25_tokenize(
-    query TEXT
-) RETURNS TEXT[]
-AS 'MODULE_PATHNAME', 'pgedge_vectorizer_bm25_tokenize'
-LANGUAGE C STRICT;
-
-COMMENT ON FUNCTION pgedge_vectorizer.bm25_tokenize IS
-'Tokenize text and return the non-stopword terms (useful for testing)';
-
 ---------------------------------------------------------------------------
 -- SQL Functions
 ---------------------------------------------------------------------------
@@ -146,7 +95,6 @@ CREATE FUNCTION pgedge_vectorizer.enable_vectorization(
 ) RETURNS VOID AS $$
 DECLARE
     chunk_table TEXT;
-    v_source_relname TEXT;
     trigger_name TEXT;
     actual_strategy TEXT;
     actual_chunk_size INT;
@@ -213,13 +161,8 @@ BEGIN
 
     RAISE NOTICE 'Using primary key column: % (%)', source_pk, pk_col_type;
 
-    -- Determine chunk table name.
-    -- Use the unqualified relname so that schema-qualified source tables
-    -- (e.g. myschema.docs → relname = 'docs') produce a simple identifier
-    -- that %I can quote correctly.  Custom chunk_table_name is kept as-is.
-    SELECT relname INTO v_source_relname FROM pg_class WHERE oid = source_table;
-    chunk_table := COALESCE(chunk_table_name,
-                            v_source_relname || '_' || source_column || '_chunks');
+    -- Determine chunk table name
+    chunk_table := COALESCE(chunk_table_name, source_table::TEXT || '_' || source_column || '_chunks');
 
     -- Create chunks table
     -- Note: pk_col_type uses %s (not %I) because format_type() returns
@@ -233,18 +176,10 @@ BEGIN
             content TEXT NOT NULL,
             token_count INT,
             embedding vector(%s),
-            sparse_embedding sparsevec(65536),
             created_at TIMESTAMPTZ DEFAULT NOW(),
             updated_at TIMESTAMPTZ DEFAULT NOW(),
             UNIQUE(source_id, chunk_index)
         )', chunk_table, pk_col_type, embedding_dimension);
-
-    -- Add sparse columns to pre-existing chunk tables (upgrade path).
-    -- These are no-ops for freshly created tables (columns exist already).
-    EXECUTE format('
-        ALTER TABLE %I
-        ADD COLUMN IF NOT EXISTS sparse_embedding sparsevec(65536)',
-        chunk_table);
 
     -- Create vector index for similarity search
     EXECUTE format('
@@ -256,33 +191,6 @@ BEGIN
     EXECUTE format('
         CREATE INDEX IF NOT EXISTS %I ON %I (source_id)',
         chunk_table || '_source_id_idx', chunk_table);
-
-    -- Create HNSW index on sparse_embedding for fast sparse search
-    EXECUTE format('
-        CREATE INDEX IF NOT EXISTS %I ON %I
-        USING hnsw (sparse_embedding sparsevec_ip_ops)
-        WHERE sparse_embedding IS NOT NULL',
-        chunk_table || '_sparse_idx', chunk_table);
-
-    -- Create BM25 IDF statistics table for this chunk table
-    EXECUTE format('
-        CREATE TABLE IF NOT EXISTS %I (
-            term        TEXT    PRIMARY KEY,
-            doc_freq    INT     NOT NULL DEFAULT 1,
-            total_docs  INT     NOT NULL DEFAULT 1,
-            idf_weight  FLOAT8  NOT NULL DEFAULT 0.693,
-            updated_at  TIMESTAMPTZ DEFAULT now()
-        )', chunk_table || '_idf_stats');
-
-    -- Register in vectorizers table for hybrid_search() lookups.
-    -- Use EXECUTE...USING to avoid PL/pgSQL variable/column ambiguity.
-    EXECUTE
-        'INSERT INTO pgedge_vectorizer.vectorizers
-             (source_table, source_column, chunk_table)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (source_table, source_column)
-         DO UPDATE SET chunk_table = EXCLUDED.chunk_table'
-    USING source_table::TEXT, source_column, chunk_table;
 
     -- Create trigger to chunk and queue on insert/update
     trigger_name := source_table::TEXT || '_' || source_column || '_vectorization_trigger';
@@ -392,27 +300,11 @@ DECLARE
     trigger_name TEXT;
     chunk_table TEXT;
     trigger_rec RECORD;
-    chunk_tables_to_drop TEXT[];
-    ct TEXT;
 BEGIN
     -- If column specified, drop that specific trigger
     IF source_column IS NOT NULL THEN
         trigger_name := source_table::TEXT || '_' || source_column || '_vectorization_trigger';
-
-        -- Look up the authoritative chunk table name from the registry so that
-        -- custom chunk_table_name values (passed to enable_vectorization) are
-        -- honored; fall back to the default convention only when not registered.
-        -- Use EXECUTE...USING to avoid variable/column name ambiguity for
-        -- source_table and source_column (same pattern as the DELETE below).
-        EXECUTE
-            'SELECT v.chunk_table FROM pgedge_vectorizer.vectorizers v
-              WHERE v.source_table = $1 AND v.source_column = $2'
-        INTO chunk_table
-        USING source_table::TEXT, source_column;
-
-        IF chunk_table IS NULL THEN
-            chunk_table := source_table::TEXT || '_' || source_column || '_chunks';
-        END IF;
+        chunk_table := source_table::TEXT || '_' || source_column || '_chunks';
 
         -- Drop trigger
         EXECUTE format('DROP TRIGGER IF EXISTS %I ON %s', trigger_name, source_table);
@@ -420,18 +312,8 @@ BEGIN
         -- Remove orphaned queue items for this chunk table
         EXECUTE format('DELETE FROM pgedge_vectorizer.queue WHERE chunk_table = %L AND status IN (''pending'', ''processing'')', chunk_table);
 
-        -- Remove from vectorizers registry.
-        -- Use EXECUTE...USING to avoid PL/pgSQL variable/column
-        -- name ambiguity for source_table and source_column.
-        EXECUTE
-            'DELETE FROM pgedge_vectorizer.vectorizers
-              WHERE source_table = $1 AND source_column = $2'
-        USING source_table::TEXT, source_column;
-
-        -- Optionally drop chunk table and IDF stats table
+        -- Optionally drop chunk table
         IF drop_chunk_table THEN
-            EXECUTE format('DROP TABLE IF EXISTS %I CASCADE',
-                           chunk_table || '_idf_stats');
             EXECUTE format('DROP TABLE IF EXISTS %I CASCADE', chunk_table);
             RAISE NOTICE 'Vectorization disabled and chunk table dropped: %', chunk_table;
         ELSE
@@ -455,25 +337,9 @@ BEGIN
         WHERE q.chunk_table LIKE source_table::TEXT || '_%_chunks'
         AND q.status IN ('pending', 'processing');
 
-        -- Collect chunk table names before deleting registry entries
-        SELECT ARRAY(
-            SELECT v.chunk_table
-            FROM pgedge_vectorizer.vectorizers v
-            WHERE v.source_table = source_table::TEXT
-        ) INTO chunk_tables_to_drop;
-
-        -- Remove all vectorizer registry entries for this source table
-        EXECUTE
-            'DELETE FROM pgedge_vectorizer.vectorizers WHERE source_table = $1'
-        USING source_table::TEXT;
-
-        -- Optionally drop all chunk tables and their IDF stats tables
+        -- Optionally drop all chunk tables
         IF drop_chunk_table THEN
-            FOREACH ct IN ARRAY COALESCE(chunk_tables_to_drop, '{}') LOOP
-                EXECUTE format('DROP TABLE IF EXISTS %I CASCADE', ct || '_idf_stats');
-                EXECUTE format('DROP TABLE IF EXISTS %I CASCADE', ct);
-                RAISE NOTICE 'Vectorization disabled and chunk table dropped: %', ct;
-            END LOOP;
+            RAISE NOTICE 'Warning: Specify source_column to drop specific chunk table';
         END IF;
     END IF;
 END;
@@ -481,46 +347,6 @@ $$ LANGUAGE plpgsql;
 
 COMMENT ON FUNCTION pgedge_vectorizer.disable_vectorization IS
 'Disable automatic vectorization for a table';
-
--- BM25 IDF stats decrement helper
--- Called by vectorization_trigger before deleting old chunks on UPDATE so that
--- the doc_freq counts for the old document's terms are removed before the
--- worker re-increments them for the new chunks.  This prevents permanent
--- overcount of IDF stats when documents are updated.
-CREATE OR REPLACE FUNCTION pgedge_vectorizer.bm25_decrement_idf_stats(
-    p_chunk_table TEXT,
-    p_terms       TEXT[]
-) RETURNS VOID AS $$
-DECLARE
-    new_total INT;
-BEGIN
-    IF p_terms IS NULL OR array_length(p_terms, 1) IS NULL THEN
-        RETURN;
-    END IF;
-
-    -- Count chunks BEFORE the deletion so new_total reflects the post-delete
-    -- corpus size (current count minus the one document being removed).
-    EXECUTE format('SELECT GREATEST(count(*)::int - 1, 0) FROM %I', p_chunk_table)
-    INTO new_total;
-
-    EXECUTE format(
-        'UPDATE %I SET'
-        '    doc_freq   = GREATEST(doc_freq - 1, 0),'
-        '    total_docs = $1,'
-        '    idf_weight = CASE'
-        '                     WHEN GREATEST(doc_freq - 1, 0) <= 0 THEN 0.0'
-        '                     ELSE ln(1.0 + ($1::float8 - GREATEST(doc_freq - 1, 0) + 0.5)'
-        '                                  / (GREATEST(doc_freq - 1, 0) + 0.5))'
-        '                 END,'
-        '    updated_at = now()'
-        ' WHERE term = ANY($2)',
-        p_chunk_table || '_idf_stats')
-    USING new_total, p_terms;
-END;
-$$ LANGUAGE plpgsql;
-
-COMMENT ON FUNCTION pgedge_vectorizer.bm25_decrement_idf_stats IS
-'Decrement doc_freq in the _idf_stats table for a set of terms before their source chunks are deleted';
 
 -- Trigger function for vectorization
 CREATE FUNCTION pgedge_vectorizer.vectorization_trigger()
@@ -571,25 +397,6 @@ BEGIN
             END IF;
             IF doc_content = old_content OR (doc_content IS NULL AND old_content IS NULL) THEN
                 RETURN NEW;
-            END IF;
-        END;
-    END IF;
-
-    -- On UPDATE, decrement IDF stats for the old document's terms before
-    -- deleting the old chunks.  This prevents doc_freq from drifting upward
-    -- when the worker later re-increments stats for the new chunks.
-    IF TG_OP = 'UPDATE' THEN
-        DECLARE
-            old_terms TEXT[];
-            old_content_for_idf TEXT;
-        BEGIN
-            EXECUTE format('SELECT $1.%I', content_col) USING OLD INTO old_content_for_idf;
-            IF old_content_for_idf IS NOT NULL THEN
-                old_content_for_idf := trim(old_content_for_idf);
-            END IF;
-            IF old_content_for_idf IS NOT NULL AND old_content_for_idf <> '' THEN
-                old_terms := pgedge_vectorizer.bm25_tokenize(old_content_for_idf);
-                PERFORM pgedge_vectorizer.bm25_decrement_idf_stats(chunk_table, old_terms);
             END IF;
         END;
     END IF;
@@ -789,14 +596,12 @@ CREATE FUNCTION pgedge_vectorizer.recreate_chunks(
 ) RETURNS INT AS $$
 DECLARE
     chunk_table_name TEXT;
-    v_source_relname TEXT;
     rows_affected INT := 0;
     trigger_name TEXT;
     trigger_exists BOOLEAN;
 BEGIN
-    -- Use the unqualified relname to avoid schema-prefix issues with %I.
-    SELECT relname INTO v_source_relname FROM pg_class WHERE oid = source_table_name;
-    chunk_table_name := v_source_relname || '_' || source_column_name || '_chunks';
+    -- Determine chunk table name
+    chunk_table_name := source_table_name::TEXT || '_' || source_column_name || '_chunks';
 
     -- Verify chunk table exists
     IF to_regclass(chunk_table_name) IS NULL THEN
@@ -818,12 +623,8 @@ BEGIN
 
     RAISE NOTICE 'Recreating chunks for %.% -> %', source_table_name, source_column_name, chunk_table_name;
 
-    -- Delete all existing chunks and reset IDF stats.
-    -- Truncating _idf_stats is safe here because recreate_chunks rebuilds
-    -- all chunks from scratch; the worker will repopulate IDF stats as it
-    -- processes the newly queued chunks.
+    -- Delete all existing chunks
     EXECUTE format('DELETE FROM %I', chunk_table_name);
-    EXECUTE format('TRUNCATE TABLE %I', chunk_table_name || '_idf_stats');
     GET DIAGNOSTICS rows_affected = ROW_COUNT;
     RAISE NOTICE 'Deleted % existing chunks', rows_affected;
 
@@ -945,166 +746,3 @@ COMMENT ON FUNCTION pgedge_vectorizer.show_config IS
 -- GRANT USAGE ON SCHEMA pgedge_vectorizer TO PUBLIC;
 -- GRANT SELECT ON ALL TABLES IN SCHEMA pgedge_vectorizer TO PUBLIC;
 -- GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA pgedge_vectorizer TO PUBLIC;
--- hybrid.sql
--- Hybrid BM25 + dense vector search using Reciprocal Rank Fusion (RRF).
---
--- Requires: pgedge_vectorizer.enable_hybrid = true in postgresql.conf
--- and pgvector >= 0.7.0 for sparsevec support.
-
----------------------------------------------------------------------------
--- hybrid_search() — main user-facing function
----------------------------------------------------------------------------
-
-CREATE OR REPLACE FUNCTION pgedge_vectorizer.hybrid_search(
-    p_source_table   REGCLASS,
-    p_query          TEXT,
-    p_limit          INT     DEFAULT 10,
-    p_alpha          FLOAT8  DEFAULT 0.7,
-    p_rrf_k          INT     DEFAULT 60,
-    p_source_column  NAME    DEFAULT NULL
-)
-RETURNS TABLE (
-    source_id   TEXT,
-    chunk       TEXT,
-    dense_rank  INT,
-    sparse_rank INT,
-    rrf_score   FLOAT8
-)
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_chunk_table  TEXT;
-    v_query_dense  vector;
-    v_query_sparse sparsevec;
-BEGIN
-    -- Look up the chunk table from the vectorizers registry.
-    -- When p_source_column is provided, use the exact mapping.
-    -- When NULL, raise an exception if the table has more than one
-    -- vectorized column to avoid silently returning results from the
-    -- wrong chunk table.
-    IF p_source_column IS NOT NULL THEN
-        SELECT vz.chunk_table INTO v_chunk_table
-        FROM pgedge_vectorizer.vectorizers vz
-        WHERE vz.source_table = p_source_table::TEXT
-          AND vz.source_column = p_source_column;
-    ELSE
-        SELECT vz.chunk_table INTO v_chunk_table
-        FROM pgedge_vectorizer.vectorizers vz
-        WHERE vz.source_table = p_source_table::TEXT
-        LIMIT 1;
-
-        IF v_chunk_table IS NOT NULL AND
-           (SELECT count(*) FROM pgedge_vectorizer.vectorizers
-            WHERE source_table = p_source_table::TEXT) > 1
-        THEN
-            RAISE EXCEPTION
-                'Table % has multiple vectorized columns. '
-                'Pass p_source_column to disambiguate.',
-                p_source_table;
-        END IF;
-    END IF;
-
-    IF v_chunk_table IS NULL THEN
-        RAISE EXCEPTION
-            'No vectorizer found for table %. '
-            'Call pgedge_vectorizer.enable_vectorization() first.',
-            p_source_table;
-    END IF;
-
-    -- Generate dense query vector via the existing C function
-    v_query_dense := pgedge_vectorizer.generate_embedding(p_query);
-
-    -- Generate sparse BM25 query vector
-    v_query_sparse := pgedge_vectorizer.bm25_query_vector(
-                          p_query, v_chunk_table);
-
-    -- Run both ranked lists and merge with Reciprocal Rank Fusion.
-    -- Join on chunk id (not source_id) to avoid mixing unrelated chunks
-    -- from the same document.  source_id is cast to TEXT to support
-    -- arbitrary PK types (BIGINT, UUID, VARCHAR, etc.).
-    RETURN QUERY EXECUTE format($sql$
-        WITH dense AS (
-            SELECT
-                id,
-                source_id::text AS source_id,
-                content AS chunk,
-                ROW_NUMBER() OVER (
-                    ORDER BY embedding <=> %L::vector
-                ) AS rnk
-            FROM %I
-            WHERE embedding IS NOT NULL
-            LIMIT %s * 3
-        ),
-        sparse AS (
-            SELECT
-                id,
-                source_id::text AS source_id,
-                content AS chunk,
-                ROW_NUMBER() OVER (
-                    ORDER BY sparse_embedding <#> %L::sparsevec ASC
-                ) AS rnk
-            FROM %I
-            WHERE sparse_embedding IS NOT NULL
-            LIMIT %s * 3
-        ),
-        merged AS (
-            SELECT
-                COALESCE(d.source_id, s.source_id)  AS source_id,
-                COALESCE(d.chunk,     s.chunk)       AS chunk,
-                COALESCE(d.rnk, 9999)::INT           AS dense_rank,
-                COALESCE(s.rnk, 9999)::INT           AS sparse_rank,
-                (
-                      %s::float8  / (%s + COALESCE(d.rnk, 9999))
-                    + (1.0 - %s::float8) / (%s + COALESCE(s.rnk, 9999))
-                )                                    AS rrf_score
-            FROM dense d
-            FULL OUTER JOIN sparse s USING (id)
-        )
-        SELECT
-            source_id,
-            chunk,
-            dense_rank,
-            sparse_rank,
-            rrf_score
-        FROM merged
-        ORDER BY rrf_score DESC
-        LIMIT %s
-    $sql$,
-        v_query_dense,   v_chunk_table, p_limit,
-        v_query_sparse,  v_chunk_table, p_limit,
-        p_alpha, p_rrf_k,
-        p_alpha, p_rrf_k,
-        p_limit
-    );
-END;
-$$;
-
-COMMENT ON FUNCTION pgedge_vectorizer.hybrid_search IS
-'Hybrid BM25 + dense vector search using Reciprocal Rank Fusion.
- p_alpha controls the weight of dense results (0 = pure sparse, 1 = pure dense).
- p_rrf_k is the RRF rank smoothing constant (default 60).
- Requires pgedge_vectorizer.enable_hybrid = true in postgresql.conf.';
-
----------------------------------------------------------------------------
--- hybrid_search_simple() — convenience wrapper
----------------------------------------------------------------------------
-
-CREATE OR REPLACE FUNCTION pgedge_vectorizer.hybrid_search_simple(
-    p_source_table  REGCLASS,
-    p_query         TEXT,
-    p_limit         INT  DEFAULT 10,
-    p_source_column NAME DEFAULT NULL
-)
-RETURNS TABLE (
-    source_id  TEXT,
-    chunk      TEXT,
-    rrf_score  FLOAT8
-)
-LANGUAGE sql AS $$
-    SELECT source_id, chunk, rrf_score
-    FROM pgedge_vectorizer.hybrid_search(
-             p_source_table, p_query, p_limit,
-             p_source_column => p_source_column);
-$$;
-
-COMMENT ON FUNCTION pgedge_vectorizer.hybrid_search_simple IS
-'Convenience wrapper for hybrid_search() returning only source_id, chunk, and rrf_score';
