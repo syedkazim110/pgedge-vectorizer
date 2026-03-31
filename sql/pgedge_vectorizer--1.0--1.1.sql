@@ -67,9 +67,9 @@ CREATE INDEX IF NOT EXISTS idx_queue_created_at ON pgedge_vectorizer.queue(creat
 -- Chunking function
 CREATE OR REPLACE FUNCTION pgedge_vectorizer.chunk_text(
     content TEXT,
-    strategy TEXT,
-    chunk_size INT,
-    overlap INT
+    strategy TEXT DEFAULT NULL,
+    chunk_size INT DEFAULT NULL,
+    overlap INT DEFAULT NULL
 ) RETURNS TEXT[]
 AS 'MODULE_PATHNAME', 'pgedge_vectorizer_chunk_text_sql'
 LANGUAGE C IMMUTABLE STRICT;
