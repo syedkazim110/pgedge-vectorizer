@@ -18,7 +18,6 @@ SELECT pgedge_vectorizer.enable_vectorization(
 );
 NOTICE:  Using primary key column: id (bigint)
 NOTICE:  column "sparse_embedding" of relation "hybrid_test_docs_content_chunks" already exists, skipping
-NOTICE:  column "bm25_doc_len" of relation "hybrid_test_docs_content_chunks" already exists, skipping
 NOTICE:  Vectorization enabled: hybrid_test_docs -> hybrid_test_docs_content_chunks
 NOTICE:  Strategy: token_based, chunk_size: 100, overlap: 10
 NOTICE:  Processing existing rows...
@@ -60,15 +59,15 @@ WHERE table_name   = 'hybrid_test_docs_content_chunks'
 (1 row)
 
 ---------------------------------------------------------------------------
--- Test 3: bm25_doc_len generated column exists in chunk table
+-- Test 3: token_count column exists in chunk table (used for BM25 doc length)
 ---------------------------------------------------------------------------
-SELECT column_name, is_generated
+SELECT column_name, data_type
 FROM information_schema.columns
 WHERE table_name  = 'hybrid_test_docs_content_chunks'
-  AND column_name = 'bm25_doc_len';
- column_name  | is_generated 
---------------+--------------
- bm25_doc_len | ALWAYS
+  AND column_name = 'token_count';
+ column_name | data_type 
+-------------+-----------
+ token_count | integer
 (1 row)
 
 ---------------------------------------------------------------------------

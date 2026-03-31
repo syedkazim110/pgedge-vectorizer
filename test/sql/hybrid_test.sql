@@ -44,13 +44,13 @@ WHERE table_name   = 'hybrid_test_docs_content_chunks'
   AND column_name  = 'sparse_embedding';
 
 ---------------------------------------------------------------------------
--- Test 3: bm25_doc_len generated column exists in chunk table
+-- Test 3: token_count column exists in chunk table (used for BM25 doc length)
 ---------------------------------------------------------------------------
 
-SELECT column_name, is_generated
+SELECT column_name, data_type
 FROM information_schema.columns
 WHERE table_name  = 'hybrid_test_docs_content_chunks'
-  AND column_name = 'bm25_doc_len';
+  AND column_name = 'token_count';
 
 ---------------------------------------------------------------------------
 -- Test 4: IDF stats table was created

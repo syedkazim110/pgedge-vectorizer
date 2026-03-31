@@ -546,28 +546,68 @@ process_queue_batch(int worker_id)
 						if (pgedge_vectorizer_enable_hybrid)
 						{
 							int			ntokens;
-							int			nstats;
-							int			content_len;
+							int			token_count = 0;
+							bool		is_first_process = true;
 							BM25Term   *tokens;
-							IdfStat	   *stats;
+							HTAB	   *idf_htab;
 							float8		avg_doc_len;
 							char	   *sparse_str;
 							int			ret_bm25;
+							char	   *chunk_sql;
 
-							content_len = content_lens[idx];
+							/*
+							 * Fetch token_count and check whether
+							 * sparse_embedding is already set (for
+							 * idempotency — skip IDF update on retry).
+							 */
+							chunk_sql = psprintf(
+								"SELECT token_count, "
+								"sparse_embedding IS NOT NULL "
+								"FROM %s WHERE id = %ld",
+								quote_identifier(chunk_tables[idx]),
+								chunk_ids[idx]);
+							ret_bm25 = SPI_execute(chunk_sql,
+												   true, 1);
+							pfree(chunk_sql);
+
+							if (ret_bm25 == SPI_OK_SELECT &&
+								SPI_processed > 0)
+							{
+								bool   isnull;
+								Datum  v;
+
+								v = SPI_getbinval(
+									SPI_tuptable->vals[0],
+									SPI_tuptable->tupdesc,
+									1, &isnull);
+								if (!isnull)
+									token_count = DatumGetInt32(v);
+
+								v = SPI_getbinval(
+									SPI_tuptable->vals[0],
+									SPI_tuptable->tupdesc,
+									2, &isnull);
+								if (!isnull)
+									is_first_process =
+										!DatumGetBool(v);
+							}
+
+							if (token_count <= 0)
+								token_count = 1;
+
 							tokens = bm25_tokenize(contents[idx],
-												  &ntokens);
-							stats = bm25_load_idf_stats(
-									chunk_tables[idx], &nstats);
+												   &ntokens);
+							idf_htab = bm25_load_idf_stats(
+									chunk_tables[idx]);
 							avg_doc_len = bm25_avg_doc_len_internal(
 									chunk_tables[idx]);
 							sparse_str = bm25_compute_sparse_str(
 									tokens, ntokens,
-									stats,  nstats,
+									idf_htab,
 									pgedge_vectorizer_bm25_k1,
 									pgedge_vectorizer_bm25_b,
 									avg_doc_len,
-									content_len);
+									token_count);
 
 							ret_bm25 = SPI_execute(
 								psprintf(
@@ -587,9 +627,18 @@ process_queue_batch(int worker_id)
 									 "chunk " INT64_FORMAT,
 									 chunk_ids[idx]);
 
-							bm25_update_idf_stats(
-								chunk_tables[idx],
-								tokens, ntokens);
+							if (idf_htab != NULL)
+								hash_destroy(idf_htab);
+
+							/*
+							 * Only update IDF stats the first time
+							 * this chunk is processed — retries must
+							 * not increment doc_freq again.
+							 */
+							if (is_first_process)
+								bm25_update_idf_stats(
+									chunk_tables[idx],
+									tokens, ntokens);
 						}
 
 						/* Mark as completed */

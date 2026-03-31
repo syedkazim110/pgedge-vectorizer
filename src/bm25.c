@@ -23,6 +23,8 @@
 #include "lib/stringinfo.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/errcodes.h"
+#include "utils/hsearch.h"
 #include "utils/memutils.h"
 
 /* ----------------------------------------------------------------
@@ -105,32 +107,27 @@ normalize_text_inplace(char *buf)
 }
 
 /*
- * find_term_idx — return index of tok in terms[], or -1 if not found
+ * IDF row read from the _idf_stats table via SPI.
+ * Internal to this file; not exposed in bm25.h.
  */
-static int
-find_term_idx(BM25Term *terms, int nterms, const char *tok)
+typedef struct
 {
-	int i;
-
-	for (i = 0; i < nterms; i++)
-	{
-		if (strcmp(terms[i].term, tok) == 0)
-			return i;
-	}
-	return -1;
-}
+	char   *term;
+	int     doc_freq;
+	int     total_docs;
+	float8  idf_weight;
+} IdfStat;
 
 /*
- * grow_terms — double the capacity of the terms array
+ * Term deduplication hash entry — used only inside bm25_tokenize.
+ * Maps a term string to its index in the output terms[] array.
+ * Key must be the first field for dynahash.
  */
-static BM25Term *
-grow_terms(BM25Term *terms, int *cap)
+typedef struct
 {
-	*cap = (*cap == 0) ? 16 : *cap * 2;
-	if (terms == NULL)
-		return palloc(*cap * sizeof(BM25Term));
-	return repalloc(terms, *cap * sizeof(BM25Term));
-}
+	char key[BM25_MAX_TERM_LEN]; /* null-terminated term — must be first */
+	int  idx;                     /* index in the returned terms[] array */
+} TermDedupEntry;
 
 /*
  * bm25_tokenize
@@ -140,50 +137,72 @@ grow_terms(BM25Term *terms, int *cap)
  * frequencies.  Returns a palloc'd BM25Term array; *ntokens is the
  * number of distinct terms.  Returns an empty array (never NULL) for
  * NULL or empty input.
+ *
+ * Deduplication uses a short-lived dynahash for O(1) lookups instead
+ * of the previous O(n) linear scan.
  */
 BM25Term *
 bm25_tokenize(const char *text, int *ntokens)
 {
-	char       *buf;
-	char       *tok;
-	int         cap = 1;
-	BM25Term   *terms;
-	int         nterms = 0;
-	int         idx;
+	char           *buf;
+	char           *tok;
+	char           *saveptr = NULL;
+	int             cap = 16;
+	BM25Term       *terms;
+	int             nterms = 0;
+	HASHCTL         ctl;
+	HTAB           *dedup;
 
 	*ntokens = 0;
 
 	if (text == NULL || *text == '\0')
 		return palloc0(sizeof(BM25Term));
 
-	/* Pre-allocate; avoids a NULL check after the loop */
-	terms = palloc(cap * sizeof(BM25Term));
+	/* Short-lived hash table for O(1) within-document deduplication */
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize   = BM25_MAX_TERM_LEN;
+	ctl.entrysize = sizeof(TermDedupEntry);
+	dedup = hash_create("bm25_tokenize_dedup", 64, &ctl,
+						HASH_ELEM | HASH_STRINGS);
 
-	buf = pstrdup(text);
+	terms = palloc(cap * sizeof(BM25Term));
+	buf   = pstrdup(text);
 	normalize_text_inplace(buf);
 
-	/* strtok never returns an empty token when delimiter is " " */
-	tok = strtok(buf, " ");
+	/* strtok_r is reentrant; strtok relies on global static state */
+	tok = strtok_r(buf, " ", &saveptr);
 	while (tok != NULL)
 	{
 		if (!is_stopword(tok))
 		{
-			idx = find_term_idx(terms, nterms, tok);
-			if (idx >= 0)
-				terms[idx].tf++;
+			bool            found;
+			TermDedupEntry *entry;
+
+			entry = hash_search(dedup, tok, HASH_ENTER, &found);
+			if (found)
+			{
+				terms[entry->idx].tf++;
+			}
 			else
 			{
+				/* New distinct term — append to output array */
 				if (nterms >= cap)
-					terms = grow_terms(terms, &cap);
+				{
+					cap   = cap * 2;
+					terms = repalloc(terms, cap * sizeof(BM25Term));
+				}
 				terms[nterms].term = pstrdup(tok);
 				terms[nterms].tf   = 1;
+				entry->idx         = nterms;
 				nterms++;
 			}
 		}
-		tok = strtok(NULL, " ");
+		tok = strtok_r(NULL, " ", &saveptr);
 	}
 
+	hash_destroy(dedup);
 	pfree(buf);
+
 	*ntokens = nterms;
 	return terms;
 }
@@ -191,12 +210,14 @@ bm25_tokenize(const char *text, int *ntokens)
 /*
  * bm25_load_idf_stats
  *
- * Load all rows from {chunk_table}_idf_stats via SPI.  Returns a
- * palloc'd IdfStat array; *nstats is set to the row count.  Returns
- * NULL (not an error) if the stats table does not exist yet.
+ * Load all rows from {chunk_table}_idf_stats via SPI and return them as
+ * a dynahash keyed on term for O(1) IDF lookups.  Returns NULL (not an
+ * error) if the stats table does not exist yet.
  *
  * Uses a subtransaction so a missing table does not abort the outer
- * worker transaction.  Caller must have an active SPI connection.
+ * worker transaction.  Re-throws all errors except ERRCODE_UNDEFINED_TABLE.
+ * Caller must have an active SPI connection.
+ * Caller should call hash_destroy() on the returned HTAB when done.
  */
 
 /*
@@ -224,18 +245,16 @@ read_idf_row(SPITupleTable *tuptable, int i)
 	return s;
 }
 
-IdfStat *
-bm25_load_idf_stats(const char *chunk_table, int *nstats)
+HTAB *
+bm25_load_idf_stats(const char *chunk_table)
 {
 	char            *sql;
 	int              ret;
-	IdfStat         *stats = NULL;
-	int              n;
 	bool             ok = false;
 	MemoryContext    oldctx;
 	ResourceOwner    oldowner;
-
-	*nstats = 0;
+	HTAB            *htab = NULL;
+	HASHCTL          ctl;
 
 	sql = psprintf(
 		"SELECT term, doc_freq, total_docs, idf_weight FROM %s",
@@ -257,9 +276,18 @@ bm25_load_idf_stats(const char *chunk_table, int *nstats)
 	}
 	PG_CATCH();
 	{
+		int		errcode_saved = geterrcode();
+
 		MemoryContextSwitchTo(oldctx);
 		CurrentResourceOwner = oldowner;
 		RollbackAndReleaseCurrentSubTransaction();
+
+		if (errcode_saved != ERRCODE_UNDEFINED_TABLE)
+		{
+			/* Not a missing-table error — re-throw so caller sees it */
+			PG_RE_THROW();
+		}
+
 		FlushErrorState();
 		pfree(sql);
 		return NULL;
@@ -271,20 +299,34 @@ bm25_load_idf_stats(const char *chunk_table, int *nstats)
 	if (!ok || ret != SPI_OK_SELECT || SPI_processed == 0)
 		return NULL;
 
-	n     = (int) SPI_processed;
-	stats = palloc(n * sizeof(IdfStat));
+	/* Build hash table from SPI results for O(1) lookups */
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize   = BM25_MAX_TERM_LEN;
+	ctl.entrysize = sizeof(IdfHashEntry);
+	htab = hash_create("bm25_idf_stats",
+					   (int) SPI_processed * 2,
+					   &ctl,
+					   HASH_ELEM | HASH_STRINGS);
 
-	for (int i = 0; i < n; i++)
-		stats[i] = read_idf_row(SPI_tuptable, i);
+	for (int i = 0; i < (int) SPI_processed; i++)
+	{
+		IdfStat       row   = read_idf_row(SPI_tuptable, i);
+		bool          found;
+		IdfHashEntry *entry;
 
-	*nstats = n;
-	return stats;
+		entry = hash_search(htab, row.term, HASH_ENTER, &found);
+		if (!found)
+			entry->idf_weight = row.idf_weight;
+		/* Duplicate terms: keep the first weight encountered */
+	}
+
+	return htab;
 }
 
 /*
  * bm25_avg_doc_len_internal
  *
- * Return AVG(length(content)) from chunk_table via SPI.
+ * Return AVG(token_count) from chunk_table via SPI.
  * Returns 1.0 if the table is empty.
  * Caller must have an active SPI connection.
  */
@@ -297,7 +339,7 @@ bm25_avg_doc_len_internal(const char *chunk_table)
 	Datum   val;
 	float8  result = 1.0;
 
-	sql = psprintf("SELECT AVG(length(content)) FROM %s",
+	sql = psprintf("SELECT AVG(token_count) FROM %s",
 				   quote_identifier(chunk_table));
 	ret = SPI_execute(sql, true, 1);
 	pfree(sql);
@@ -322,18 +364,19 @@ bm25_avg_doc_len_internal(const char *chunk_table)
 }
 
 /*
- * lookup_idf — find the IDF weight for a term.
+ * lookup_idf — find the IDF weight for a term via O(1) hash lookup.
  * Returns ln(2) ≈ 0.693 (i.e. idf = ln(1+1)) when not found.
  */
 static float8
-lookup_idf(const char *term, IdfStat *stats, int nstats)
+lookup_idf(const char *term, HTAB *idf_htab)
 {
-	for (int i = 0; i < nstats; i++)
-	{
-		if (strcmp(stats[i].term, term) == 0)
-			return stats[i].idf_weight;
-	}
-	return log(2.0);
+	IdfHashEntry *entry;
+
+	if (idf_htab == NULL)
+		return log(2.0);
+
+	entry = hash_search(idf_htab, term, HASH_FIND, NULL);
+	return entry ? entry->idf_weight : log(2.0);
 }
 
 typedef struct { int dim; float8 score; } DimScore;
@@ -401,7 +444,7 @@ build_sparsevec_string(DimScore *pairs, int npairs)
  */
 char *
 bm25_compute_sparse_str(BM25Term *tokens, int ntokens,
-						IdfStat *stats, int nstats,
+						HTAB *idf_htab,
 						float8 k1, float8 b,
 						float8 avg_doc_len, int doc_len)
 {
@@ -418,7 +461,7 @@ bm25_compute_sparse_str(BM25Term *tokens, int ntokens,
 	for (int i = 0; i < ntokens; i++)
 	{
 		float8  tf    = (float8) tokens[i].tf;
-		float8  idf   = lookup_idf(tokens[i].term, stats, nstats);
+		float8  idf   = lookup_idf(tokens[i].term, idf_htab);
 		float8  denom = tf + k1 * (1.0 - b + b * dl_ratio);
 		float8  score = (denom <= 0.0) ? 0.0 :
 						idf * (tf * (k1 + 1.0)) / denom;
@@ -444,7 +487,7 @@ bm25_compute_sparse_str(BM25Term *tokens, int ntokens,
  */
 Datum
 bm25_compute_sparse_vector(BM25Term *tokens, int ntokens,
-						   IdfStat *stats,  int nstats,
+						   HTAB *idf_htab,
 						   float8 k1, float8 b,
 						   float8 avg_doc_len, int doc_len)
 {
@@ -455,7 +498,7 @@ bm25_compute_sparse_vector(BM25Term *tokens, int ntokens,
 	bool    isnull;
 
 	vec_str = bm25_compute_sparse_str(tokens, ntokens,
-									  stats, nstats,
+									  idf_htab,
 									  k1, b,
 									  avg_doc_len, doc_len);
 
@@ -488,36 +531,34 @@ bm25_compute_sparse_vector(BM25Term *tokens, int ntokens,
  * Caller must have an active SPI connection.
  */
 /*
- * upsert_term_idf — insert or update a single term's IDF stats row
+ * upsert_term_idf — insert or update a single term's IDF stats row.
+ * total_docs is pre-computed once by the caller; passing it here
+ * avoids a full-table count(*) scan per term.
  */
 static void
-upsert_term_idf(const char *chunk_table, const char *term)
+upsert_term_idf(const char *chunk_table, const char *term, int total_docs)
 {
-	char   *safe_term  = quote_literal_cstr(term);
-	const char *qt     = quote_identifier(chunk_table);
-	const char *qidf   = quote_identifier(
-							psprintf("%s_idf_stats", chunk_table));
-	char   *sql;
-	int     ret;
+	char       *safe_term  = quote_literal_cstr(term);
+	const char *qidf       = quote_identifier(
+								psprintf("%s_idf_stats", chunk_table));
+	char       *sql;
+	int         ret;
 
 	sql = psprintf(
 		"INSERT INTO %s"
 		"    (term, doc_freq, total_docs, idf_weight)"
-		" SELECT %s, 1, t.cnt,"
-		"        ln(1.0 + (t.cnt - 1.0 + 0.5)"
-		"               / (1.0 + 0.5))"
-		" FROM (SELECT count(*)::int AS cnt"
-		"       FROM %s) t"
+		" VALUES (%s, 1, %d,"
+		"         ln(1.0 + (%d - 1.0 + 0.5) / (1.0 + 0.5)))"
 		" ON CONFLICT (term) DO UPDATE SET"
 		"    doc_freq   = %s.doc_freq + 1,"
-		"    total_docs = EXCLUDED.total_docs,"
+		"    total_docs = %d,"
 		"    idf_weight = ln(1.0 +"
-		"        (EXCLUDED.total_docs"
-		"         - (%s.doc_freq + 1) + 0.5)"
+		"        (%d - (%s.doc_freq + 1) + 0.5)"
 		"        / ((%s.doc_freq + 1) + 0.5)),"
 		"    updated_at = now()",
-		qidf, safe_term, qt,
-		qidf, qidf, qidf);
+		qidf, safe_term, total_docs, total_docs,
+		qidf,
+		total_docs, total_docs, qidf, qidf);
 
 	pfree(safe_term);
 	ret = SPI_execute(sql, false, 0);
@@ -535,9 +576,31 @@ bm25_update_idf_stats(const char *chunk_table,
 {
 	MemoryContext oldctx;
 	ResourceOwner oldowner;
+	int           total_docs = 0;
+	bool          isnull;
+	Datum         val;
+	char         *sql;
+	int           ret;
 
 	if (ntokens <= 0)
 		return;
+
+	/* Pre-compute total_docs once to avoid per-term count(*) scans */
+	sql = psprintf("SELECT count(*)::int FROM %s",
+				   quote_identifier(chunk_table));
+	ret = SPI_execute(sql, true, 1);
+	pfree(sql);
+
+	if (ret == SPI_OK_SELECT && SPI_processed > 0)
+	{
+		val = SPI_getbinval(SPI_tuptable->vals[0],
+							SPI_tuptable->tupdesc, 1, &isnull);
+		if (!isnull)
+			total_docs = DatumGetInt32(val);
+	}
+
+	if (total_docs <= 0)
+		total_docs = 1;
 
 	oldctx   = CurrentMemoryContext;
 	oldowner = CurrentResourceOwner;
@@ -546,7 +609,7 @@ bm25_update_idf_stats(const char *chunk_table,
 	PG_TRY();
 	{
 		for (int i = 0; i < ntokens; i++)
-			upsert_term_idf(chunk_table, tokens[i].term);
+			upsert_term_idf(chunk_table, tokens[i].term, total_docs);
 
 		ReleaseCurrentSubTransaction();
 	}
@@ -587,9 +650,8 @@ pgedge_vectorizer_bm25_query_vector(PG_FUNCTION_ARGS)
 	const char *query;
 	const char *chunk_table;
 	BM25Term   *tokens;
-	IdfStat    *stats;
+	HTAB       *idf_htab;
 	int         ntokens;
-	int         nstats;
 	float8      avg_doc_len;
 	Datum       result;
 
@@ -608,16 +670,19 @@ pgedge_vectorizer_bm25_query_vector(PG_FUNCTION_ARGS)
 	SPI_connect();
 
 	tokens      = bm25_tokenize(query, &ntokens);
-	stats       = bm25_load_idf_stats(chunk_table, &nstats);
+	idf_htab    = bm25_load_idf_stats(chunk_table);
 	avg_doc_len = bm25_avg_doc_len_internal(chunk_table);
 
 	result = bm25_compute_sparse_vector(
 				 tokens, ntokens,
-				 stats,  nstats,
+				 idf_htab,
 				 pgedge_vectorizer_bm25_k1,
 				 pgedge_vectorizer_bm25_b,
 				 avg_doc_len,
-				 (int) VARSIZE_ANY_EXHDR(query_text));
+				 ntokens);
+
+	if (idf_htab != NULL)
+		hash_destroy(idf_htab);
 
 	SPI_finish();
 

@@ -228,7 +228,6 @@ BEGIN
             token_count INT,
             embedding vector(%s),
             sparse_embedding sparsevec(65536),
-            bm25_doc_len INT GENERATED ALWAYS AS (length(content)) STORED,
             created_at TIMESTAMPTZ DEFAULT NOW(),
             updated_at TIMESTAMPTZ DEFAULT NOW(),
             UNIQUE(source_id, chunk_index)
@@ -239,12 +238,6 @@ BEGIN
     EXECUTE format('
         ALTER TABLE %I
         ADD COLUMN IF NOT EXISTS sparse_embedding sparsevec(65536)',
-        chunk_table);
-
-    EXECUTE format('
-        ALTER TABLE %I
-        ADD COLUMN IF NOT EXISTS bm25_doc_len INT
-            GENERATED ALWAYS AS (length(content)) STORED',
         chunk_table);
 
     -- Create vector index for similarity search

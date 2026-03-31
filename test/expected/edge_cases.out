@@ -16,7 +16,6 @@ SELECT pgedge_vectorizer.enable_vectorization(
 );
 NOTICE:  Using primary key column: id (bigint)
 NOTICE:  column "sparse_embedding" of relation "edge_test_content_chunks" already exists, skipping
-NOTICE:  column "bm25_doc_len" of relation "edge_test_content_chunks" already exists, skipping
 NOTICE:  Vectorization enabled: edge_test -> edge_test_content_chunks
 NOTICE:  Strategy: token_based, chunk_size: 100, overlap: 10
 NOTICE:  Processing existing rows...
@@ -110,7 +109,6 @@ SELECT pgedge_vectorizer.enable_vectorization(
 );
 NOTICE:  Using primary key column: doc_id (bigint)
 NOTICE:  column "sparse_embedding" of relation "custom_pk_test_body_chunks" already exists, skipping
-NOTICE:  column "bm25_doc_len" of relation "custom_pk_test_body_chunks" already exists, skipping
 NOTICE:  Vectorization enabled: custom_pk_test -> custom_pk_test_body_chunks
 NOTICE:  Strategy: token_based, chunk_size: 100, overlap: 10
 NOTICE:  Processing existing rows...
