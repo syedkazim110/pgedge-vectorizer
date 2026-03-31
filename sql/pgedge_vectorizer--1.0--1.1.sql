@@ -306,6 +306,7 @@ BEGIN
         i INT;
         chunk_id BIGINT;
         needs_embedding BOOLEAN;
+        needs_sparse BOOLEAN;
         rows_processed INT := 0;
     BEGIN
         RAISE NOTICE 'Processing existing rows...';
@@ -333,18 +334,32 @@ BEGIN
                                       WHEN %I.content = EXCLUDED.content THEN %I.embedding
                                       ELSE NULL
                                   END,
+                                  sparse_embedding = CASE
+                                      WHEN %I.content = EXCLUDED.content THEN %I.sparse_embedding
+                                      ELSE NULL
+                                  END,
                                   updated_at = NOW()
                     RETURNING id,
-                              (embedding IS NULL) AS needs_embedding',
-                    chunk_table, chunk_table, chunk_table)
+                              (embedding IS NULL) AS needs_embedding,
+                              (sparse_embedding IS NULL) AS needs_sparse',
+                    chunk_table, chunk_table, chunk_table, chunk_table, chunk_table)
                 USING row_record.pk_val, i, chunk_text,
                       length(chunk_text) / 4  -- Approximate token count
-                INTO chunk_id, needs_embedding;
+                INTO chunk_id, needs_embedding, needs_sparse;
 
-                -- Only queue for embedding if new or content changed
-                IF needs_embedding THEN
-                    INSERT INTO pgedge_vectorizer.queue (chunk_id, chunk_table, content)
-                    VALUES (chunk_id, chunk_table, chunk_text);
+                -- Queue if dense or sparse work is needed.
+                IF needs_embedding OR needs_sparse THEN
+                    INSERT INTO pgedge_vectorizer.queue (chunk_id, chunk_table, content, metadata)
+                    VALUES (
+                        chunk_id,
+                        chunk_table,
+                        chunk_text,
+                        CASE
+                            WHEN NOT needs_embedding AND needs_sparse
+                                THEN jsonb_build_object('sparse_only', true)
+                            ELSE NULL
+                        END
+                    );
                 END IF;
             END LOOP;
 
@@ -1046,29 +1061,43 @@ BEGIN
     -- from the same document.  source_id is cast to TEXT to support
     -- arbitrary PK types (BIGINT, UUID, VARCHAR, etc.).
     RETURN QUERY EXECUTE format($sql$
-        WITH dense AS (
+        WITH dense_candidates AS (
             SELECT
                 id,
                 source_id::text AS source_id,
                 content AS chunk,
-                ROW_NUMBER() OVER (
-                    ORDER BY embedding <=> %L::vector
-                ) AS rnk
+                embedding <=> %L::vector AS dist
             FROM %I
             WHERE embedding IS NOT NULL
+            ORDER BY dist
+            LIMIT %s * 3
+        ),
+        dense AS (
+            SELECT
+                id,
+                source_id,
+                chunk,
+                ROW_NUMBER() OVER (ORDER BY dist) AS rnk
+            FROM dense_candidates
+        ),
+        sparse_candidates AS (
+            SELECT
+                id,
+                source_id::text AS source_id,
+                content AS chunk,
+                sparse_embedding <#> %L::sparsevec AS dist
+            FROM %I
+            WHERE sparse_embedding IS NOT NULL
+            ORDER BY dist ASC
             LIMIT %s * 3
         ),
         sparse AS (
             SELECT
                 id,
-                source_id::text AS source_id,
-                content AS chunk,
-                ROW_NUMBER() OVER (
-                    ORDER BY sparse_embedding <#> %L::sparsevec ASC
-                ) AS rnk
-            FROM %I
-            WHERE sparse_embedding IS NOT NULL
-            LIMIT %s * 3
+                source_id,
+                chunk,
+                ROW_NUMBER() OVER (ORDER BY dist ASC) AS rnk
+            FROM sparse_candidates
         ),
         merged AS (
             SELECT
