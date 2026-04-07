@@ -5,7 +5,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION pgedge_vectorizer;
 -- Verify schema created
 SELECT nspname FROM pg_namespace WHERE nspname = 'pgedge_vectorizer';
-      nspname      
+      nspname
 -------------------
  pgedge_vectorizer
 (1 row)
@@ -13,7 +13,7 @@ SELECT nspname FROM pg_namespace WHERE nspname = 'pgedge_vectorizer';
 -- Verify queue table created
 SELECT tablename FROM pg_tables
 WHERE schemaname = 'pgedge_vectorizer' AND tablename = 'queue';
- tablename 
+ tablename
 -----------
  queue
 (1 row)
@@ -27,10 +27,10 @@ WHERE setting IN (
     'pgedge_vectorizer.default_chunk_overlap'
 )
 ORDER BY setting;
-                 setting                 | value  
+                 setting                 | value
 -----------------------------------------+--------
  pgedge_vectorizer.default_chunk_overlap | 50
  pgedge_vectorizer.default_chunk_size    | 400
- pgedge_vectorizer.provider              | openai
+ pgedge_vectorizer.provider              | ollama
 (3 rows)
 
