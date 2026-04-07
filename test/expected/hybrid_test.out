@@ -170,10 +170,10 @@ SELECT COALESCE(
 -------------
            0
 (1 row)
-
 ---------------------------------------------------------------------------
 -- Test 12: hybrid_search raises a clear exception for unknown table
 ---------------------------------------------------------------------------
+SET pgedge_vectorizer.enable_hybrid = true;
 DO $$
 BEGIN
     PERFORM pgedge_vectorizer.hybrid_search(
@@ -190,6 +190,7 @@ EXCEPTION
 END;
 $$;
 NOTICE:  Got expected exception: No vectorizer found for table pg_class. Call pgedge_vectorizer.enable_vectorization() first.
+RESET pgedge_vectorizer.enable_hybrid;
 ---------------------------------------------------------------------------
 -- Test 13: hybrid_search raises when enable_hybrid is false
 ---------------------------------------------------------------------------
@@ -212,13 +213,7 @@ NOTICE:  Got expected exception: Hybrid search is disabled. Set pgedge_vectorize
 ---------------------------------------------------------------------------
 -- Test 14: bm25_query_vector returns a non-null sparsevec
 ---------------------------------------------------------------------------
-SELECT pg_typeof(
-    pgedge_vectorizer.bm25_query_vector(
-        'quick brown fox',
-        'hybrid_test_docs_content_chunks'
-    )
-)::text AS result_type;
- result_type
+ result_type 
 -------------
  sparsevec
 (1 row)
@@ -226,10 +221,7 @@ SELECT pg_typeof(
 ---------------------------------------------------------------------------
 -- Test 15: bm25_avg_doc_len returns a sensible default for an empty table
 ---------------------------------------------------------------------------
-SELECT pgedge_vectorizer.bm25_avg_doc_len(
-    'hybrid_test_docs_content_chunks'
-) >= 0 AS non_negative;
- non_negative
+ non_negative 
 --------------
  t
 (1 row)
@@ -237,46 +229,32 @@ SELECT pgedge_vectorizer.bm25_avg_doc_len(
 ---------------------------------------------------------------------------
 -- Test 16: BM25 tokenizer returns empty array for NULL input
 ---------------------------------------------------------------------------
-SELECT COALESCE(
-    array_length(pgedge_vectorizer.bm25_tokenize(NULL), 1),
-    0
-) AS token_count;
- token_count
+ token_count 
 -------------
-           0
+            0
 (1 row)
 
 ---------------------------------------------------------------------------
 -- Test 17: BM25 tokenizer returns empty array for all-stopword input
 ---------------------------------------------------------------------------
-SELECT COALESCE(
-    array_length(pgedge_vectorizer.bm25_tokenize('the is a an and'), 1),
-    0
-) AS token_count;
- token_count
+ token_count 
 -------------
-           0
+            0
 (1 row)
 
 ---------------------------------------------------------------------------
 -- Test 18: bm25_decrement_idf_stats handles NULL/empty terms gracefully
 ---------------------------------------------------------------------------
 -- Should return without error for NULL terms
-SELECT pgedge_vectorizer.bm25_decrement_idf_stats(
-    'hybrid_test_docs_content_chunks', NULL, 1
-);
- bm25_decrement_idf_stats
+ bm25_decrement_idf_stats 
 --------------------------
-
+ 
 (1 row)
 
 -- Should return without error for empty array
-SELECT pgedge_vectorizer.bm25_decrement_idf_stats(
-    'hybrid_test_docs_content_chunks', '{}'::text[], 1
-);
- bm25_decrement_idf_stats
+ bm25_decrement_idf_stats 
 --------------------------
-
+ 
 (1 row)
 
 ---------------------------------------------------------------------------
@@ -287,23 +265,15 @@ INSERT INTO hybrid_test_docs_content_chunks_idf_stats
     (term, doc_freq, total_docs, idf_weight)
 VALUES ('testterm', 5, 10, 1.0);
 -- Decrement by 1
-SELECT pgedge_vectorizer.bm25_decrement_idf_stats(
-    'hybrid_test_docs_content_chunks',
-    ARRAY['testterm'],
-    1
-);
- bm25_decrement_idf_stats
+ bm25_decrement_idf_stats 
 --------------------------
-
+ 
 (1 row)
 
 -- Verify the count was reduced
-SELECT term, doc_freq
-FROM hybrid_test_docs_content_chunks_idf_stats
-WHERE term = 'testterm';
-   term   | doc_freq
+   term   | doc_freq 
 ----------+----------
- testterm |        4
+ testterm |         4
 (1 row)
 
 -- Clean up the test row
@@ -330,17 +300,14 @@ NOTICE:  Vectorization enabled: hybrid_cleanup_test -> hybrid_cleanup_test_body_
 NOTICE:  Strategy: token_based, chunk_size: 100, overlap: 10
 NOTICE:  Processing existing rows...
 NOTICE:  Processed 0 existing rows
- enable_vectorization
+ enable_vectorization 
 ----------------------
-
+ 
 (1 row)
 
 -- Verify _idf_stats table exists before disable
-SELECT tablename
-FROM pg_tables
-WHERE tablename = 'hybrid_cleanup_test_body_chunks_idf_stats';
-                 tablename
---------------------------------------------
+                 tablename                 
+-------------------------------------------
  hybrid_cleanup_test_body_chunks_idf_stats
 (1 row)
 
@@ -349,18 +316,15 @@ SELECT pgedge_vectorizer.disable_vectorization(
     'hybrid_cleanup_test'::regclass, 'body', true
 );
 NOTICE:  Vectorization disabled and chunk table dropped: hybrid_cleanup_test_body_chunks
- disable_vectorization
+ disable_vectorization 
 -----------------------
-
+ 
 (1 row)
 
 -- Verify _idf_stats table was also dropped
-SELECT count(*) AS idf_stats_exists
-FROM pg_tables
-WHERE tablename = 'hybrid_cleanup_test_body_chunks_idf_stats';
- idf_stats_exists
+ idf_stats_exists 
 ------------------
-                0
+                 0
 (1 row)
 
 DROP TABLE hybrid_cleanup_test;
@@ -384,9 +348,9 @@ NOTICE:  Vectorization enabled: hybrid_multi_test -> hybrid_multi_test_title_chu
 NOTICE:  Strategy: token_based, chunk_size: 100, overlap: 10
 NOTICE:  Processing existing rows...
 NOTICE:  Processed 0 existing rows
- enable_vectorization
+ enable_vectorization 
 ----------------------
-
+ 
 (1 row)
 
 SELECT pgedge_vectorizer.enable_vectorization(
@@ -400,9 +364,9 @@ NOTICE:  Vectorization enabled: hybrid_multi_test -> hybrid_multi_test_body_chun
 NOTICE:  Strategy: token_based, chunk_size: 100, overlap: 10
 NOTICE:  Processing existing rows...
 NOTICE:  Processed 0 existing rows
- enable_vectorization
+ enable_vectorization 
 ----------------------
-
+ 
 (1 row)
 
 -- hybrid_search without specifying column should raise
@@ -432,9 +396,9 @@ NOTICE:  Dropped trigger: hybrid_multi_test_title_vectorization_trigger
 NOTICE:  Dropped trigger: hybrid_multi_test_body_vectorization_trigger
 NOTICE:  Vectorization disabled and chunk table dropped: hybrid_multi_test_title_chunks
 NOTICE:  Vectorization disabled and chunk table dropped: hybrid_multi_test_body_chunks
- disable_vectorization
+ disable_vectorization 
 -----------------------
-
+ 
 (1 row)
 
 DROP TABLE hybrid_multi_test;
@@ -445,9 +409,9 @@ SELECT pgedge_vectorizer.disable_vectorization(
     'hybrid_test_docs'::regclass, 'content', true
 );
 NOTICE:  Vectorization disabled and chunk table dropped: hybrid_test_docs_content_chunks
- disable_vectorization
+ disable_vectorization 
 -----------------------
-
+ 
 (1 row)
 
 DROP TABLE hybrid_test_docs;

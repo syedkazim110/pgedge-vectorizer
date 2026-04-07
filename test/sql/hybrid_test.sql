@@ -132,6 +132,8 @@ SELECT COALESCE(
 -- Test 12: hybrid_search raises a clear exception for unknown table
 ---------------------------------------------------------------------------
 
+SET pgedge_vectorizer.enable_hybrid = true;
+
 DO $$
 BEGIN
     PERFORM pgedge_vectorizer.hybrid_search(
@@ -147,6 +149,8 @@ EXCEPTION
         END IF;
 END;
 $$;
+
+RESET pgedge_vectorizer.enable_hybrid;
 
 ---------------------------------------------------------------------------
 -- Test 13: hybrid_search raises when enable_hybrid is false
