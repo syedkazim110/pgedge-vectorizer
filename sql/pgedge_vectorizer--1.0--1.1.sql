@@ -462,12 +462,17 @@ BEGIN
             RAISE NOTICE 'Dropped trigger: %', trigger_rec.tgname;
         END LOOP;
 
-        -- Collect chunk table names before deleting registry entries
-        SELECT ARRAY(
-            SELECT v.chunk_table
-            FROM pgedge_vectorizer.vectorizers v
-            WHERE v.source_table = source_table::TEXT
-        ) INTO chunk_tables_to_drop;
+        -- Collect chunk table names before deleting registry entries.
+        -- Use EXECUTE...USING to avoid PL/pgSQL variable/column
+        -- name ambiguity for source_table.
+        EXECUTE
+            'SELECT ARRAY(
+                SELECT v.chunk_table
+                FROM pgedge_vectorizer.vectorizers v
+                WHERE v.source_table = $1
+            )'
+        INTO chunk_tables_to_drop
+        USING source_table::TEXT;
 
         -- Remove orphaned queue items for exact chunk tables from registry.
         DELETE FROM pgedge_vectorizer.queue q

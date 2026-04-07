@@ -231,7 +231,7 @@ NOTICE:  Got expected exception: Hybrid search is disabled. Set pgedge_vectorize
 ---------------------------------------------------------------------------
  token_count 
 -------------
-            0
+           0
 (1 row)
 
 ---------------------------------------------------------------------------
@@ -239,7 +239,7 @@ NOTICE:  Got expected exception: Hybrid search is disabled. Set pgedge_vectorize
 ---------------------------------------------------------------------------
  token_count 
 -------------
-            0
+           0
 (1 row)
 
 ---------------------------------------------------------------------------
@@ -324,7 +324,7 @@ NOTICE:  Vectorization disabled and chunk table dropped: hybrid_cleanup_test_bod
 -- Verify _idf_stats table was also dropped
  idf_stats_exists 
 ------------------
-                 0
+                0
 (1 row)
 
 DROP TABLE hybrid_cleanup_test;

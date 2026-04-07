@@ -230,7 +230,7 @@ pgedge_vectorizer_init_guc(void)
 		"sparse_embedding column of the chunk table.",
 		&pgedge_vectorizer_enable_hybrid,
 		false,
-		PGC_SIGHUP,
+		PGC_USERSET,
 		0,
 		NULL, NULL, NULL);
 
