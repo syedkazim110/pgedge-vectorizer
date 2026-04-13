@@ -13,10 +13,12 @@
 #include "pgedge_vectorizer.h"
 
 #include <curl/curl.h>
+#include <pwd.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "utils/memutils.h"
+
 
 /*
  * Response buffer for libcurl
@@ -287,6 +289,15 @@ load_api_key(const char *filepath, char **error_msg)
 			 expanded_path);
 	}
 
+	/* Reject unreasonably large files before reading (CWE-20) */
+	if (st.st_size > MAX_API_KEY_FILE_SIZE)
+	{
+		*error_msg = psprintf("API key file exceeds maximum allowed size of %d bytes",
+							  MAX_API_KEY_FILE_SIZE);
+		pfree(expanded_path);
+		return NULL;
+	}
+
 	/* Open and read file */
 	fp = fopen(expanded_path, "r");
 	if (fp == NULL)
@@ -337,8 +348,19 @@ expand_tilde(const char *path)
 {
 	if (path[0] == '~' && (path[1] == '/' || path[1] == '\0'))
 	{
-		const char *home = getenv("HOME");
-		if (home)
+		const char *home = NULL;
+		struct passwd *pw;
+
+		/*
+		 * Use getpwuid() rather than getenv("HOME"): environment variables
+		 * are attacker-controllable and must not be trusted for path
+		 * resolution (CWE-807).
+		 */
+		pw = getpwuid(geteuid());
+		if (pw != NULL)
+			home = pw->pw_dir;
+
+		if (home != NULL && home[0] != '\0')
 			return psprintf("%s%s", home, path + 1);
 	}
 	return pstrdup(path);
