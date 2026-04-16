@@ -43,6 +43,9 @@
 #define PGEDGE_NORETURN_SUFFIX
 #endif
 
+/* Maximum size of an API key file; guards against unbounded reads (CWE-20) */
+#define MAX_API_KEY_FILE_SIZE	4096
+
 /*
  * GUC Variables (declared extern, defined in guc.c)
  */

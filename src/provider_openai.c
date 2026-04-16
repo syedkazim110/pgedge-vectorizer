@@ -12,6 +12,8 @@
 #include "pgedge_vectorizer.h"
 
 #include <curl/curl.h>
+#include <fcntl.h>
+#include <pwd.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -260,6 +262,8 @@ load_api_key(const char *filepath, char **error_msg)
 	char *expanded_path;
 	StringInfoData key_buf;
 	int c;
+	int fd;
+	size_t bytes_read;
 	struct stat st;
 
 	if (filepath == NULL || filepath[0] == '\0')
@@ -271,10 +275,32 @@ load_api_key(const char *filepath, char **error_msg)
 	/* Expand tilde */
 	expanded_path = expand_tilde(filepath);
 
-	/* Check file exists and has proper permissions */
-	if (stat(expanded_path, &st) != 0)
+	/*
+	 * Open the file first, then validate with fstat() on the open descriptor
+	 * to avoid TOCTOU races between stat() and fopen().
+	 */
+	fd = open(expanded_path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
 	{
-		*error_msg = psprintf("API key file not found: %s", expanded_path);
+		*error_msg = psprintf("Failed to open API key file: %s", expanded_path);
+		pfree(expanded_path);
+		return NULL;
+	}
+
+	if (fstat(fd, &st) != 0)
+	{
+		*error_msg = psprintf("Failed to stat API key file: %s", expanded_path);
+		close(fd);
+		pfree(expanded_path);
+		return NULL;
+	}
+
+	/* Reject non-regular files (e.g. devices, FIFOs, directories) */
+	if (!S_ISREG(st.st_mode))
+	{
+		*error_msg = psprintf("API key path is not a regular file: %s",
+							  expanded_path);
+		close(fd);
 		pfree(expanded_path);
 		return NULL;
 	}
@@ -286,25 +312,52 @@ load_api_key(const char *filepath, char **error_msg)
 			 expanded_path);
 	}
 
-	/* Open and read file */
-	fp = fopen(expanded_path, "r");
+	/* Reject unreasonably large files before reading (CWE-20) */
+	if (st.st_size > MAX_API_KEY_FILE_SIZE)
+	{
+		*error_msg = psprintf("API key file exceeds maximum allowed size of %d bytes",
+							  MAX_API_KEY_FILE_SIZE);
+		close(fd);
+		pfree(expanded_path);
+		return NULL;
+	}
+
+	/* Convert to FILE* for character-at-a-time reading */
+	fp = fdopen(fd, "r");
 	if (fp == NULL)
 	{
-		*error_msg = psprintf("Failed to open API key file: %s", expanded_path);
+		*error_msg = psprintf("Failed to open API key file stream: %s",
+							  expanded_path);
+		close(fd);
 		pfree(expanded_path);
 		return NULL;
 	}
 
 	initStringInfo(&key_buf);
 
-	/* Read the file, trimming whitespace */
+	/*
+	 * Read the file, trimming whitespace.  Enforce a runtime size limit as a
+	 * defence-in-depth measure — the file could have grown since fstat().
+	 */
+	bytes_read = 0;
 	while ((c = fgetc(fp)) != EOF)
 	{
+		bytes_read++;
+		if (bytes_read > MAX_API_KEY_FILE_SIZE)
+		{
+			*error_msg = psprintf("API key file exceeds maximum allowed size "
+								  "of %d bytes during read",
+								  MAX_API_KEY_FILE_SIZE);
+			fclose(fp);
+			pfree(key_buf.data);
+			pfree(expanded_path);
+			return NULL;
+		}
 		if (c != '\n' && c != '\r' && c != ' ' && c != '\t')
 			appendStringInfoChar(&key_buf, c);
 	}
 
-	fclose(fp);
+	fclose(fp);	/* also closes fd */
 	pfree(expanded_path);
 
 	if (key_buf.len == 0)
@@ -336,8 +389,19 @@ expand_tilde(const char *path)
 {
 	if (path[0] == '~' && (path[1] == '/' || path[1] == '\0'))
 	{
-		const char *home = getenv("HOME");
-		if (home)
+		const char *home = NULL;
+		struct passwd *pw;
+
+		/*
+		 * Use getpwuid() rather than getenv("HOME"): environment variables
+		 * are attacker-controllable and must not be trusted for path
+		 * resolution (CWE-807).
+		 */
+		pw = getpwuid(geteuid());
+		if (pw != NULL)
+			home = pw->pw_dir;
+
+		if (home != NULL && home[0] != '\0')
 			return psprintf("%s%s", home, path + 1);
 	}
 	return pstrdup(path);
