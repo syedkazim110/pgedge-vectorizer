@@ -330,8 +330,7 @@ Count approximate tokens in text using the UTF-8 character-based approximation (
 
 ```sql
 SELECT pgedge_vectorizer.count_tokens(
-    p_text  TEXT,
-    p_model TEXT DEFAULT NULL   -- reserved for future use
+    p_text TEXT
 ) RETURNS INT;
 ```
 
