@@ -35,6 +35,9 @@ SELECT pgedge_vectorizer.count_tokens('test') AS tokens;
 -- NULL input returns NULL (STRICT function)
 SELECT pgedge_vectorizer.count_tokens(NULL) IS NULL AS is_null;
 
+-- '你好世界' = 4 UTF-8 characters, not 12 bytes; (4+3)/4 = 1
+SELECT pgedge_vectorizer.count_tokens('你好世界') AS tokens;
+
 ---------------------------------------------------------------------------
 -- Test 4: tiktoken_count_tokens() PL/pgSQL wrapper is registered
 ---------------------------------------------------------------------------
@@ -186,6 +189,40 @@ SELECT pgedge_vectorizer.disable_vectorization(
     'tiktoken_refresh_test'::regclass, 'content', true
 );
 DROP TABLE tiktoken_refresh_test;
+
+---------------------------------------------------------------------------
+-- Test 10: refresh_token_counts() works with a schema-qualified chunk table
+-- Exercises the %s/REGCLASS fix to ensure non-default schemas are handled.
+---------------------------------------------------------------------------
+CREATE SCHEMA tiktoken_ns_test;
+
+CREATE TABLE tiktoken_ns_test.ns_chunks (
+    id          BIGSERIAL PRIMARY KEY,
+    source_id   BIGINT    NOT NULL DEFAULT 1,
+    content     TEXT      NOT NULL,
+    token_count INT
+);
+
+INSERT INTO tiktoken_ns_test.ns_chunks (content)
+VALUES ('Schema-qualified refresh test.'),
+       ('Another row for schema test.');
+
+UPDATE tiktoken_ns_test.ns_chunks SET token_count = 0;
+
+SELECT COUNT(*) AS zeroed
+FROM tiktoken_ns_test.ns_chunks
+WHERE token_count = 0;
+
+SELECT pgedge_vectorizer.refresh_token_counts(
+    'tiktoken_ns_test.ns_chunks'::regclass
+) >= 1 AS refresh_returned_count;
+
+SELECT COALESCE(BOOL_AND(token_count > 0), false) AS all_refreshed
+FROM tiktoken_ns_test.ns_chunks;
+
+-- Cleanup test 10
+DROP TABLE tiktoken_ns_test.ns_chunks;
+DROP SCHEMA tiktoken_ns_test;
 
 ---------------------------------------------------------------------------
 -- Cleanup

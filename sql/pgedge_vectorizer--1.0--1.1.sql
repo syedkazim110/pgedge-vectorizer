@@ -190,6 +190,13 @@ BEGIN
         'Internal plpython3u helper used by tiktoken_count_tokens(); do not call directly.'
     $inner$;
 
+    -- Verify tiktoken Python package is importable at runtime
+    BEGIN
+        PERFORM pgedge_vectorizer._tiktoken_internal('', 'cl100k_base');
+    EXCEPTION WHEN OTHERS THEN
+        RETURN 'tiktoken not available: ' || SQLERRM;
+    END;
+
     RETURN 'ok';
 END;
 $$;

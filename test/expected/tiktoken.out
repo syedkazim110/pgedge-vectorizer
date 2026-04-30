@@ -57,6 +57,13 @@ SELECT pgedge_vectorizer.count_tokens(NULL) IS NULL AS is_null;
  t
 (1 row)
 
+-- '你好世界' = 4 UTF-8 characters, not 12 bytes; (4+3)/4 = 1
+SELECT pgedge_vectorizer.count_tokens('你好世界') AS tokens;
+ tokens 
+--------
+      1
+(1 row)
+
 ---------------------------------------------------------------------------
 -- Test 4: tiktoken_count_tokens() PL/pgSQL wrapper is registered
 ---------------------------------------------------------------------------
@@ -265,6 +272,48 @@ NOTICE:  Vectorization disabled and chunk table dropped: tiktoken_refresh_test_c
 (1 row)
 
 DROP TABLE tiktoken_refresh_test;
+---------------------------------------------------------------------------
+-- Test 10: refresh_token_counts() works with a schema-qualified chunk table
+-- Exercises the %s/REGCLASS fix to ensure non-default schemas are handled.
+---------------------------------------------------------------------------
+CREATE SCHEMA tiktoken_ns_test;
+CREATE TABLE tiktoken_ns_test.ns_chunks (
+    id          BIGSERIAL PRIMARY KEY,
+    source_id   BIGINT    NOT NULL DEFAULT 1,
+    content     TEXT      NOT NULL,
+    token_count INT
+);
+INSERT INTO tiktoken_ns_test.ns_chunks (content)
+VALUES ('Schema-qualified refresh test.'),
+       ('Another row for schema test.');
+UPDATE tiktoken_ns_test.ns_chunks SET token_count = 0;
+SELECT COUNT(*) AS zeroed
+FROM tiktoken_ns_test.ns_chunks
+WHERE token_count = 0;
+ zeroed 
+--------
+      2
+(1 row)
+
+SELECT pgedge_vectorizer.refresh_token_counts(
+    'tiktoken_ns_test.ns_chunks'::regclass
+) >= 1 AS refresh_returned_count;
+NOTICE:  refresh_token_counts: updated 2 rows in tiktoken_ns_test.ns_chunks
+ refresh_returned_count 
+------------------------
+ t
+(1 row)
+
+SELECT COALESCE(BOOL_AND(token_count > 0), false) AS all_refreshed
+FROM tiktoken_ns_test.ns_chunks;
+ all_refreshed 
+---------------
+ t
+(1 row)
+
+-- Cleanup test 10
+DROP TABLE tiktoken_ns_test.ns_chunks;
+DROP SCHEMA tiktoken_ns_test;
 ---------------------------------------------------------------------------
 -- Cleanup
 ---------------------------------------------------------------------------

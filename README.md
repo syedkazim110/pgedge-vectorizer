@@ -354,6 +354,28 @@ To enable accurate tiktoken counting:
 
 When `use_tiktoken = on` and `plpython3u`/`tiktoken` are unavailable, the function falls back to the approximation with a `NOTICE`.
 
+#### `enable_tiktoken_support()`
+
+Creates (or recreates) the internal `_tiktoken_internal` plpython3u helper used by `tiktoken_count_tokens()`. Call this after installing `plpython3u` and the `tiktoken` Python package when the extension was originally loaded without plpython3u support.
+
+```sql
+SELECT pgedge_vectorizer.enable_tiktoken_support() RETURNS TEXT;
+```
+
+Returns `'ok'` on success, or a descriptive message if `plpython3u` is not installed or the `tiktoken` Python package cannot be imported at runtime.
+
+#### `refresh_token_counts()`
+
+Recompute `token_count` for every row in a chunk table using the current `tiktoken_count_tokens()` setting. Useful after enabling `use_tiktoken = on` to backfill accurate counts without a full `recreate_chunks()` rebuild.
+
+```sql
+SELECT pgedge_vectorizer.refresh_token_counts(
+    p_chunk_table REGCLASS
+) RETURNS BIGINT;
+```
+
+Returns the number of rows updated.
+
 #### `show_config()`
 
 Show all configuration settings.
